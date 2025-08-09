@@ -2,7 +2,7 @@ name: Invoice Renamer
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every minute (UTC)
+    - cron: "*/5 * * * *"   # reliable cadence; can try */1 later
   workflow_dispatch: {}
 
 concurrency:
@@ -25,6 +25,14 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install Python deps
         run: pip install -r requirements.txt
 
@@ -32,4 +40,5 @@ jobs:
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          DEBUG_LIST: "1"   # set to "0" after we verify visibility
         run: python process_invoices.py
