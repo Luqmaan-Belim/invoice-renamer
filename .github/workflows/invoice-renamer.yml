@@ -2,7 +2,7 @@ name: Invoice Renamer
 
 on:
   schedule:
-    - cron: "*/1 * * * *"   # every minute (UTC)
+    - cron: "*/5 * * * *"   # every minute (UTC)
   workflow_dispatch: {}
 
 concurrency:
