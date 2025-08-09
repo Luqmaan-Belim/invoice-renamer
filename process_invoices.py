@@ -22,12 +22,22 @@ def drive():
 
 def resolve_folder(d, folder_id):
     """Return (actual_folder_id, is_shared_drive, drive_id_or_None). Also resolves shortcuts."""
-    meta = d.files().get(fileId=folder_id, fields="id, name, mimeType, driveId, shortcutDetails").execute()
+    meta = d.files().get(
+        fileId=folder_id,
+        fields="id, name, mimeType, driveId, shortcutDetails",
+        supportsAllDrives=True
+    ).execute()
+
     if meta.get("mimeType") == "application/vnd.google-apps.shortcut":
         target = meta["shortcutDetails"]["targetId"]
         logging.info("Resolved shortcut: %s -> %s", folder_id, target)
-        meta = d.files().get(fileId=target, fields="id, name, mimeType, driveId").execute()
+        meta = d.files().get(
+            fileId=target,
+            fields="id, name, mimeType, driveId",
+            supportsAllDrives=True
+        ).execute()
         folder_id = meta["id"]
+
     is_shared = bool(meta.get("driveId"))
     return folder_id, is_shared, meta.get("driveId")
 
