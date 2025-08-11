@@ -1,8 +1,8 @@
-name: Invoice Renamer
+name: Invoice Renamer (Changes API)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # reliable cadence; can try */1 later
+    - cron: "*/5 * * * *"    # reliable cadence; you can try */1 later
   workflow_dispatch: {}
 
 concurrency:
@@ -36,9 +36,23 @@ jobs:
       - name: Install Python deps
         run: pip install -r requirements.txt
 
-      - name: Process invoices
+      - name: Restore Drive change token
+        id: token
+        uses: actions/cache@v4
+        with:
+          path: .drive_change_token
+          key: drive-change-token
+
+      - name: Process invoices (changes-only)
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          DEBUG_LIST: "1"   # set to "0" after we verify visibility
+          DEBUG_LIST: "0"
         run: python process_invoices.py
+
+      - name: Save Drive change token
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .drive_change_token
+          key: drive-change-token
