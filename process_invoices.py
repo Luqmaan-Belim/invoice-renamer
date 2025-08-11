@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """
-Invoice Renamer — GitHub Actions version (Drive-based)
+Invoice Renamer — GitHub Actions (Drive Changes API)
 
-ENV (set as GitHub Actions secrets or env):
-  GDRIVE_SA_JSON   : stringified JSON of a Google service-account key
-  GDRIVE_FOLDER_ID : ID of the target folder (not a shortcut)
-  DEBUG_LIST       : "1" to print a few discovered files (optional)
+- Polls Google Drive "changes" using a page token so we only see NEW/CHANGED files.
+- Filters to PDFs that live under your target folder (including subfolders).
+- Runs Tesseract OCR on the first page and renames the file in its own folder.
+- Works with My Drive and Shared Drives, and resolves folder shortcuts for the root.
 
-Requires (same libs you already use):
+ENV (GitHub Secrets/Env):
+  GDRIVE_SA_JSON   : JSON of a Google service-account key (as one string)
+  GDRIVE_FOLDER_ID : ID of the *actual* target folder (not a shortcut)
+  DEBUG_LIST       : "1" to print debug info (optional)
+
+Requires (pip):
   google-api-python-client, google-auth, google-auth-httplib2, google-auth-oauthlib
   pytesseract, pdf2image, opencv-python-headless, numpy, Pillow
-  (Plus system packages: tesseract-ocr, poppler-utils)
 
-Notes:
-- Add the service-account email to the folder (My Drive) OR to the whole Shared Drive
-  as Content manager, so it can see/rename files.
+System packages on runner:
+  tesseract-ocr, poppler-utils
 """
 
-import os, io, re, json, time, logging
-from typing import List, Dict, Tuple, Optional
+import os, io, re, json, logging, pathlib
+from typing import Optional, Tuple
 
 import numpy as np
 import cv2
@@ -29,33 +32,19 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
 
-# ---------- Logging ----------
+# ---------- Config & logging ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("invoice_renamer")
-log.setLevel(logging.INFO)
-_fmt = logging.Formatter("%(asctime)s - %(message)s")
 
-# Log to stdout (so you see it in Actions) AND to file (optional)
-console = logging.StreamHandler()
-console.setFormatter(_fmt)
-log.addHandler(console)
-
-file_handler = logging.FileHandler("invoice_renamer.log")
-file_handler.setFormatter(_fmt)
-log.addHandler(file_handler)
-
-# No Windows tesseract path in Actions; system tesseract is used.
-# pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"  # not required normally
-
-# ---------- Config ----------
 FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"].strip()
 SA_JSON = json.loads(os.environ["GDRIVE_SA_JSON"])
-DEBUG_LIST = os.environ.get("DEBUG_LIST", "0") == "1"
+DEBUG = os.environ.get("DEBUG_LIST", "0") == "1"
 
+TOKEN_PATH = pathlib.Path(".drive_change_token")  # persisted via Actions cache
 PDF_MT = "application/pdf"
 FOLDER_MT = "application/vnd.google-apps.folder"
 SHORTCUT_MT = "application/vnd.google-apps.shortcut"
-
-RENAMED = re.compile(r"^\d{4}_?\d{1,6}(?:_\d+)?\.pdf$", re.I)
+RENAMED_RE = re.compile(r"^\d{4}_?\d{1,6}(?:_\d+)?\.pdf$", re.I)
 
 
 # ---------- Drive helpers ----------
@@ -66,91 +55,137 @@ def drive():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def resolve_folder(d, folder_id: str) -> Tuple[str, bool, Optional[str]]:
-    """Return (folder_id, is_shared_drive, drive_id). Resolve shortcuts to the real folder."""
+def resolve_root(d, folder_id: str) -> Tuple[str, bool, Optional[str]]:
+    """Return (real_root_id, is_shared_drive, drive_id). Resolve if given ID is a shortcut."""
     meta = d.files().get(
         fileId=folder_id,
         fields="id,name,mimeType,driveId,shortcutDetails",
         supportsAllDrives=True,
     ).execute()
-
     if meta.get("mimeType") == SHORTCUT_MT:
-        target = meta["shortcutDetails"]["targetId"]
-        log.info("Resolved shortcut: %s -> %s", folder_id, target)
+        tgt = meta["shortcutDetails"]["targetId"]
+        log.info("Resolved shortcut root: %s -> %s", folder_id, tgt)
         meta = d.files().get(
-            fileId=target,
+            fileId=tgt,
             fields="id,name,mimeType,driveId",
             supportsAllDrives=True,
         ).execute()
-        folder_id = meta["id"]
-
-    is_shared = bool(meta.get("driveId"))
-    return folder_id, is_shared, meta.get("driveId")
+    return meta["id"], bool(meta.get("driveId")), meta.get("driveId")
 
 
-def list_pdfs_recursive(d, root_id: str, is_shared: bool, drive_id: Optional[str]) -> List[Dict]:
-    """
-    BFS through root + subfolders (+ folder shortcuts). Return items:
-    {"id", "name", "parent"} for PDFs that are NOT already renamed.
-    """
-    queue = [root_id]
-    seen = set()
-    out: List[Dict] = []
-
-    base_kwargs = dict(
-        fields="nextPageToken, files(id,name,mimeType,parents,shortcutDetails)",
-        pageSize=1000,
-        orderBy="createdTime desc",
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    )
+def get_start_token(d, is_shared: bool, drive_id: Optional[str]) -> str:
+    """Get a startPageToken for My Drive or a specific Shared Drive."""
     if is_shared and drive_id:
-        base_kwargs.update(corpora="drive", driveId=drive_id)
-
-    while queue:
-        folder_id = queue.pop(0)
-        if folder_id in seen:
-            continue
-        seen.add(folder_id)
-
-        q = f"'{folder_id}' in parents and trashed=false"
-        token = None
-        while True:
-            kwargs = dict(base_kwargs, q=q)
-            if token:
-                kwargs["pageToken"] = token
-            resp = d.files().list(**kwargs).execute()
-
-            for f in resp.get("files", []):
-                mt = f.get("mimeType", "")
-                if mt == SHORTCUT_MT:
-                    sd = f.get("shortcutDetails", {})
-                    tgt_id = sd.get("targetId")
-                    tgt_mt = sd.get("targetMimeType")
-                    if tgt_mt == FOLDER_MT and tgt_id:
-                        queue.append(tgt_id)
-                    continue
-                if mt == FOLDER_MT:
-                    queue.append(f["id"])
-                    continue
-                if mt == PDF_MT and not RENAMED.match(f.get("name", "")):
-                    parent = (f.get("parents") or [folder_id])[0]
-                    out.append({"id": f["id"], "name": f["name"], "parent": parent})
-
-            token = resp.get("nextPageToken")
-            if not token:
-                break
-
-    if DEBUG_LIST:
-        log.info("DEBUG: unrenamed PDFs across tree: %d", len(out))
-        for f in out[:12]:
-            log.info("DEBUG: %s (parent=%s)", f["name"], f["parent"])
-    return out
+        resp = d.changes().getStartPageToken(driveId=drive_id, supportsAllDrives=True).execute()
+    else:
+        resp = d.changes().getStartPageToken().execute()
+    return resp["startPageToken"]
 
 
-def unique_name_in_folder(d, folder_id: str, base_name: str) -> str:
-    """Return a unique name inside the given folder."""
-    name, n = base_name, 1
+def load_token() -> Optional[str]:
+    try:
+        return TOKEN_PATH.read_text().strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def save_token(token: str):
+    TOKEN_PATH.write_text(token)
+
+
+def file_meta(d, fid: str):
+    """Fetch minimal metadata we need for filtering."""
+    return d.files().get(
+        fileId=fid,
+        fields="id,name,mimeType,parents,driveId,trashed",
+        supportsAllDrives=True,
+    ).execute()
+
+
+def is_under_root(d, file_parents, root_id: str, cache) -> bool:
+    """
+    Ascend parents until we hit root_id or top.
+    Cache parent->parents lookups to reduce API calls when multiple files share ancestry.
+    """
+    # Some files may have multiple parents (rare). Check any chain.
+    if not file_parents:
+        return False
+    stack = list(file_parents)
+    while stack:
+        pid = stack.pop()
+        if pid == root_id:
+            return True
+        if pid in cache:
+            # cached: None means top/not under root; list means its parents
+            parents = cache[pid]
+        else:
+            try:
+                md = d.files().get(
+                    fileId=pid,
+                    fields="id, parents",
+                    supportsAllDrives=True,
+                ).execute()
+                parents = md.get("parents") or []
+            except Exception:
+                parents = []
+            cache[pid] = parents if parents else None
+        if parents:
+            stack.extend(parents)
+    return False
+
+
+def download_first_page(d, fid: str) -> Optional[np.ndarray]:
+    """Download PDF bytes and rasterize first page at 300 DPI with Poppler."""
+    buf = io.BytesIO()
+    req = d.files().get_media(fileId=fid)
+    dl = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    buf.seek(0)
+    images = convert_from_bytes(buf.getvalue(), dpi=300, first_page=1, last_page=1)
+    return np.array(images[0]) if images else None
+
+
+def rename_in_drive(d, fid: str, new_name: str):
+    d.files().update(fileId=fid, body={"name": new_name}, supportsAllDrives=True).execute()
+
+
+# ---------- Your OCR logic (unchanged) ----------
+def ocr_with_confidence(image: np.ndarray):
+    data = pytesseract.image_to_data(
+        image, config="--psm 6 --oem 3", output_type=pytesseract.Output.DICT
+    )
+    text = " ".join([t for t in data.get("text", []) if t]).strip()
+    confs = [c for c in data.get("conf", []) if isinstance(c, (int, float)) and c != -1]
+    avg = sum(confs) / len(confs) if confs else 0.0
+    return text, avg
+
+
+def preprocess_image(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    gray = cv2.equalizeHist(gray)
+    return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY, 11, 2)
+
+
+def extract_invoice_number(text: str) -> Optional[str]:
+    m = re.search(r"(?:INV|NV)[^\d]*(\d{4}[^\d]*\d{1,6})", text, flags=re.I)
+    if not m:
+        return None
+    s = m.group(1).strip()
+    for k, v in {"A": "4", " ": "", "/": "_", "O": "0", "I": "1"}.items():
+        s = s.replace(k, v)
+    s = re.sub(r"[^\d_]", "", s)
+    parts = s.split("_")
+    if len(parts) == 2 and len(parts[1]) < 6:
+        parts[1] = parts[1].ljust(6, "0")
+        s = "_".join(parts)
+    return s
+
+
+def unique_name_in_folder(d, folder_id: str, base: str) -> str:
+    name, n = base, 1
     while True:
         q = f"name = '{name}' and '{folder_id}' in parents and trashed=false"
         res = d.files().list(
@@ -159,134 +194,98 @@ def unique_name_in_folder(d, folder_id: str, base_name: str) -> str:
         ).execute()
         if not res.get("files"):
             return name
-        root, ext = os.path.splitext(base_name)
+        root, ext = os.path.splitext(base)
         name = f"{root}_{n}{ext}"
         n += 1
 
 
-def rename_in_drive(d, file_id: str, new_name: str):
-    d.files().update(
-        fileId=file_id, body={"name": new_name}, supportsAllDrives=True
-    ).execute()
-
-
-def download_first_page(d, file_id: str) -> Optional[np.ndarray]:
-    """Download the PDF and rasterize only the first page (300 DPI)."""
-    buf = io.BytesIO()
-    req = d.files().get_media(fileId=file_id)
-    dl = MediaIoBaseDownload(buf, req)
-    done = False
-    while not done:
-        _, done = dl.next_chunk()
-    buf.seek(0)
-    imgs = convert_from_bytes(buf.getvalue(), dpi=300, first_page=1, last_page=1)
-    return np.array(imgs[0]) if imgs else None
-
-
-# ---------- Your OCR pipeline (unchanged) ----------
-class InvoiceRenamer:
-    def __init__(self):
-        self.processed_ids = set()
-
-    def process_and_rename(self, d, file_id: str, parent_id: str, name: str):
-        if file_id in self.processed_ids:
-            return
-        self.processed_ids.add(file_id)
-
-        try:
-            log.info("Processing: %s (%s)", name, file_id)
-
-            image = download_first_page(d, file_id)
-            if image is None:
-                log.warning("No image extracted from %s", name)
-                return
-
-            text, avg_confidence = self.ocr_with_confidence(image)
-            log.info("OCR confidence: %.2f", avg_confidence)
-            log.info("Extracted Text:\n%s", text)
-
-            if avg_confidence < 40:
-                log.info("Low OCR confidence, preprocessing and retrying...")
-                image = self.preprocess_image(image)
-                text, avg_confidence = self.ocr_with_confidence(image)
-                log.info("Retried OCR confidence: %.2f", avg_confidence)
-                log.info("Retried Extracted Text:\n%s", text)
-
-            invoice_number = self.extract_invoice_number(text) or "UNKNOWN"
-
-            new_name = unique_name_in_folder(d, parent_id, f"{invoice_number}.pdf")
-            if new_name == name:
-                log.info("Already correctly named; skipping.")
-                return
-
-            rename_in_drive(d, file_id, new_name)
-            log.info("Renamed %s -> %s", name, new_name)
-
-        finally:
-            # In a batch run, just discard the id
-            self.processed_ids.discard(file_id)
-
-    def ocr_with_confidence(self, image):
-        data = pytesseract.image_to_data(
-            image, config="--psm 6 --oem 3", output_type=pytesseract.Output.DICT
-        )
-        text = " ".join(data.get("text", [])).strip()
-        confidences = [c for c in data.get("conf", []) if isinstance(c, (int, float)) and c != -1]
-        avg_confidence = sum(confidences) / len(confidences) if confidences else 0
-        return text, avg_confidence
-
-    def preprocess_image(self, image):
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        gray = cv2.equalizeHist(gray)
-        processed = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        )
-        return processed
-
-    def extract_invoice_number(self, text):
-        regex = r"(?:INV|NV)[^\d]*(\d{4}[^\d]*\d{1,6})"
-        match = re.search(regex, text)
-        if match:
-            raw_invoice_number = match.group(1).strip()
-            cleaned = self.clean_invoice_number(raw_invoice_number)
-            log.info("Raw Invoice: %s, Cleaned Invoice: %s", raw_invoice_number, cleaned)
-            return cleaned
-        return None
-
-    def clean_invoice_number(self, invoice_number):
-        corrections = {
-            "A": "4",
-            " ": "",
-            "/": "_",
-            "O": "0",
-            "I": "1",
-        }
-        for k, v in corrections.items():
-            invoice_number = invoice_number.replace(k, v)
-        invoice_number = re.sub(r"[^\d_]", "", invoice_number)
-        parts = invoice_number.split("_")
-        if len(parts) == 2 and len(parts[1]) < 6:
-            invoice_number = f"{parts[0]}_{parts[1]}{'0' * (6 - len(parts[1]))}"
-        log.info("Final Cleaned Invoice: %s", invoice_number)
-        return invoice_number
-
-
-# ---------- Batch entry point (replaces filesystem watcher) ----------
-def run_drive_batch():
+# ---------- Main (changes-driven) ----------
+def main():
     d = drive()
-    root_id, is_shared, drive_id = resolve_folder(d, FOLDER_ID)
-    renamer = InvoiceRenamer()
+    root_id, is_shared, drive_id = resolve_root(d, FOLDER_ID)
 
-    # Recursively gather PDFs across root + subfolders
-    targets = list_pdfs_recursive(d, root_id, is_shared, drive_id)
-    if not targets:
-        log.info("No PDFs to process.")
-        return
+    token = load_token()
+    if not token:
+        token = get_start_token(d, is_shared, drive_id)
+        save_token(token)
+        log.info("Initialized change token.")
+        return  # First run just initializes; next run will process deltas
 
-    log.info("Found %d PDF(s) across folder + subfolders", len(targets))
-    for f in targets:
-        renamer.process_and_rename(d, f["id"], f["parent"], f["name"])
+    parent_cache = {}  # folder_id -> parents list (or None if top/not under root)
+    processed = 0
+    next_token = None
+
+    # List changes since token; may be multiple pages
+    while True:
+        kwargs = dict(pageToken=token, fields="nextPageToken,newStartPageToken,changes(fileId,removed,file) ",
+                      includeItemsFromAllDrives=True, supportsAllDrives=True)
+        if is_shared and drive_id:
+            kwargs.update(driveId=drive_id)
+        resp = d.changes().list(**kwargs).execute()
+
+        for ch in resp.get("changes", []):
+            fid = ch.get("fileId")
+            removed = ch.get("removed", False)
+            fobj = ch.get("file") or {}
+
+            # Skip deletions or items with no file object
+            if removed or not fobj:
+                continue
+
+            # Quick filters
+            if fobj.get("trashed"):
+                continue
+            if fobj.get("mimeType") != PDF_MT:
+                continue
+            name = fobj.get("name", "")
+            if RENAMED_RE.match(name or ""):
+                continue
+
+            # Ensure file is under our root (ascend parents)
+            # If file doesn't have parents in 'file', fetch fresh metadata
+            parents = fobj.get("parents")
+            if not parents:
+                meta = file_meta(d, fid)
+                if meta.get("trashed"):
+                    continue
+                parents = meta.get("parents") or []
+                name = meta.get("name", name)
+
+            if not is_under_root(d, parents, root_id, parent_cache):
+                continue
+
+            # Download first page and OCR
+            img = download_first_page(d, fid)
+            if img is None:
+                log.warning("No image for %s; skipping", name)
+                continue
+
+            text, conf = ocr_with_confidence(img)
+            if conf < 40:
+                img2 = preprocess_image(img)
+                text, conf = ocr_with_confidence(img2)
+            inv = extract_invoice_number(text) or "UNKNOWN"
+
+            # Use the nearest parent folder (first parent)
+            parent_id = parents[0] if parents else root_id
+            new_name = unique_name_in_folder(d, parent_id, f"{inv}.pdf")
+            if new_name != name:
+                rename_in_drive(d, fid, new_name)
+                log.info("Renamed: %s -> %s", name, new_name)
+                processed += 1
+
+        token = resp.get("nextPageToken")
+        if not token:
+            next_token = resp.get("newStartPageToken")
+            break
+
+    # Save the token for the next run
+    if next_token:
+        save_token(next_token)
+
+    if DEBUG:
+        log.info("Done. Processed %d file(s) this run.", processed)
 
 
 if __name__ == "__main__":
-    run_drive_batch()
+    main()
