@@ -2,39 +2,35 @@ name: Invoice Renamer (Changes API)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"    # reliable cadence; you can try */1 later
+    - cron: "*/5 * * * *"      # reliable cadence; you can try */1 later
   workflow_dispatch: {}
 
 concurrency:
   group: invoice-renamer
   cancel-in-progress: true
 
+# Needed so the job can pull your *private* GHCR image
+permissions:
+  contents: read
+  packages: read
+
 jobs:
   run:
     runs-on: ubuntu-latest
+
+    # Run all steps *inside* your private container
+    container:
+      image: ghcr.io/luqmaan-belim/invoice-renamer:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    timeout-minutes: 3
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system packages (Tesseract + Poppler)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr poppler-utils
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install Python deps
-        run: pip install -r requirements.txt
+      # No apt-get or pip here — they’re already baked into the image.
 
       - name: Restore Drive change token
         id: token
