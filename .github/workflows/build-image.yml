@@ -25,4 +25,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}/invoice-renamer:latest
+          tags: ghcr.io/luqmaan-belim/invoice-renamer:latest
