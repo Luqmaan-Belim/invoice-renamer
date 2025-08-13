@@ -26,7 +26,7 @@ from typing import Optional, Tuple
 import numpy as np
 import cv2
 import pytesseract
-from pdf2image import convert_from_bytes
+import fitz  # PyMuPDF
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -134,17 +134,35 @@ def is_under_root(d, file_parents, root_id: str, cache) -> bool:
     return False
 
 
-def download_first_page(d, fid: str) -> Optional[np.ndarray]:
-    """Download PDF bytes and rasterize first page at 300 DPI with Poppler."""
+def download_first_page(drive, file_id):
+    """
+    Download PDF bytes and rasterize first page at 300 DPI using PyMuPDF.
+    Returns an RGB NumPy array (H,W,3) suitable for OpenCV/Tesseract, or None.
+    """
+    import io
+    from googleapiclient.http import MediaIoBaseDownload
+
     buf = io.BytesIO()
-    req = d.files().get_media(fileId=fid)
+    req = drive.files().get_media(fileId=file_id)
     dl = MediaIoBaseDownload(buf, req)
     done = False
     while not done:
         _, done = dl.next_chunk()
-    buf.seek(0)
-    images = convert_from_bytes(buf.getvalue(), dpi=300, first_page=1, last_page=1)
-    return np.array(images[0]) if images else None
+    pdf_bytes = buf.getvalue()
+    if not pdf_bytes:
+        return None
+
+    # DPI -> zoom: 72pt = 1.0 zoom. For ~300 DPI: 300/72 ≈ 4.1667
+    zoom = 300 / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        if doc.page_count == 0:
+            return None
+        page = doc.load_page(0)
+        pix = page.get_pixmap(matrix=mat, alpha=False)  # RGB
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        return img
 
 
 def rename_in_drive(d, fid: str, new_name: str):
