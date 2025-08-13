@@ -3,7 +3,7 @@ google-auth
 google-auth-httplib2
 google-auth-oauthlib
 pytesseract
-pdf2image
+PyMuPDF
 opencv-python-headless
 numpy
 Pillow
