@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: invoice-renamer
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -23,20 +23,28 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 12
 
+    concurrency:
+      group: invoice-renamer
+      cancel-in-progress: false
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Restore Drive change token
-        uses: actions/cache@v4
+        id: token
+        uses: actions/cache/restore@v4
         with:
           path: .drive_change_token
-          key: drive-change-token
+          key: drive-change-token-
+          restore-keys: |
+            drive-change-token-
 
       - name: Process invoices (changes-only)
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           DEBUG_LIST: "0"
+          # MAX_FILES_PER_RUN: "300"  # uncomment if you want to cap per run
         run: python process_invoices.py
 
       - name: Save Drive change token
@@ -44,4 +52,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .drive_change_token
-          key: drive-change-token
+          key: drive-change-token-${{ github.run_id }}
