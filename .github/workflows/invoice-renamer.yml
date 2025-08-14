@@ -23,10 +23,6 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 12
 
-    concurrency:
-      group: invoice-renamer
-      cancel-in-progress: false
-
     steps:
       - uses: actions/checkout@v4
 
