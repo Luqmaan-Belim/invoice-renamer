@@ -1,12 +1,14 @@
 name: Invoice Renamer (Changes API)
 
 on:
+  repository_dispatch:
+    types: [drive_change]     # <— instant trigger from Worker
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/30 * * * *"    # backup every 30 mins (optional)
   workflow_dispatch: {}
 
 concurrency:
-  group: invoice-renamer
+  group: invoice-renamer-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -22,7 +24,6 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 12
-
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +41,7 @@ jobs:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           DEBUG_LIST: "0"
-          # MAX_FILES_PER_RUN: "300"  # uncomment if you want to cap per run
+          GRACE_SECONDS: "90"                # we’ll use this below
         run: python process_invoices.py
 
       - name: Save Drive change token
