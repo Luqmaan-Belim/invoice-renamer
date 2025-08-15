@@ -3,10 +3,8 @@ name: drive_change
 on:
   repository_dispatch:
     types: [drive_change]
-
   schedule:
-    - cron: "0,30 * * * *"
-
+    - cron: "0,30 * * * *"   # optional periodic sweep
   workflow_dispatch: {}
 
 permissions:
@@ -22,8 +20,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    # Use your prebuilt image — NOTE: must be all lowercase
     container:
-      image: ghcr.io/${{ github.repository | lower }}:latest
+      image: ghcr.io/luqmaan-belim/invoice-renamer:latest
 
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +31,6 @@ jobs:
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          MAX_FILES_PER_RUN: "120"
+          MAX_FILES_PER_RUN: "120"   # adjust as needed
           DEBUG_LIST: "0"
         run: python /app/process_invoices.py
