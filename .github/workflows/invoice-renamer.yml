@@ -1,62 +1,33 @@
-name: drive_change
+name: Invoice Renamer (Changes API)
 
 on:
-  # Triggered by your Cloudflare Worker
+  workflow_dispatch:
   repository_dispatch:
     types: [drive_change]
-
-  # Optional fallback poll (remove if you don't want it)
-  schedule:
-    - cron: "0,30 * * * *"
-
-  workflow_dispatch: {}
-
-permissions:
-  contents: read
-  packages: read
-
-# Queue runs; never cancel one already in progress
-concurrency:
-  group: invoice-renamer-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
-
-    # Use the prebuilt image you pushed to GHCR (all lowercase path)
-    container:
-      image: ghcr.io/luqmaan-belim/invoice-renamer:latest
-
     steps:
       - uses: actions/checkout@v4
 
-      # Persist the Drive change token across runs (so we only see deltas)
-      - name: Restore Drive change token
-        id: token
-        uses: actions/cache/restore@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          path: .drive_change_token
-          key: drive-token-v7-
-          restore-keys: |
-            drive-token-v7-
+          python-version: "3.11"
 
-      - name: Process invoices (new-file only; batch)
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr poppler-utils libgl1
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Process invoices (IMG* only)
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-
-          # Behavior knobs
-          GRACE_SECONDS: "60"          # allow uploads to finish
-          NEW_WINDOW_SECONDS: "1800"   # treat last 30 min as "new"
-          MAX_FILES_PER_RUN: "80"      # <-- process up to 80 new PDFs in one run
-          DEBUG_LIST: "0"
-        run: python3 /app/process_invoices.py
-
-      - name: Save Drive change token
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .drive_change_token
-          key: drive-token-v7-${{ github.run_id }}
+          MAX_FILES_PER_RUN: "100"   # process up to 100 files in one run
+          DEBUG_LIST: "1"
+        run: python3 process_invoices.py
