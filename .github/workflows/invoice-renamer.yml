@@ -1,52 +1,55 @@
 name: Invoice Renamer (Changes API)
 
 on:
-  repository_dispatch:
-    types: [drive_change]     # <— instant trigger from Worker
+  workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"    # backup every 30 mins (optional)
-  workflow_dispatch: {}
-
-concurrency:
-  group: invoice-renamer-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
-
-permissions:
-  contents: read
-  packages: read
+    - cron: "*/5 * * * *"  # poll every 5 minutes
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/luqmaan-belim/invoice-renamer:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    timeout-minutes: 12
-    steps:
-      - uses: actions/checkout@v4
+    concurrency:
+      group: invoice-renamer
+      cancel-in-progress: false
 
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # Cache Drive change token so we know what's new between runs
       - name: Restore Drive change token
-        id: token
-        uses: actions/cache/restore@v4
+        uses: actions/cache@v4
         with:
           path: .drive_change_token
-          key: drive-change-token-
-          restore-keys: |
-            drive-change-token-
+          key: drive-change-token
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr poppler-utils libgl1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
+          pip install pytesseract pymupdf opencv-python-headless numpy Pillow
 
       - name: Process invoices (changes-only)
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          DEBUG_LIST: "0"
-          GRACE_SECONDS: "90"                # we’ll use this below
+          DEBUG_LIST: "1"   # set "0" to reduce logs
+          GRACE_SECONDS: "90"
+          MAX_FILES_PER_RUN: "0"
         run: python process_invoices.py
 
       - name: Save Drive change token
-        if: always()
         uses: actions/cache/save@v4
         with:
           path: .drive_change_token
-          key: drive-change-token-${{ github.run_id }}
+          key: drive-change-token
