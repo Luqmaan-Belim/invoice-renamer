@@ -1,11 +1,9 @@
 name: drive_change
 
 on:
-  # Triggered by your Cloudflare Worker
   repository_dispatch:
     types: [drive_change]
 
-  # Optional periodic sweep (remove if not needed)
   schedule:
     - cron: "0,30 * * * *"
 
@@ -15,7 +13,6 @@ permissions:
   contents: read
   packages: read
 
-# Queue runs; don't cancel in-progress jobs
 concurrency:
   group: invoice-renamer-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -25,9 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
-    # Use your prebuilt image (lowercase path). If you used my earlier build workflow:
     container:
-      image: ghcr.io/${{ toLower(github.repository) }}:latest
+      image: ghcr.io/${{ github.repository | lower }}:latest
 
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +32,6 @@ jobs:
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          MAX_FILES_PER_RUN: "120"   # adjust to suit your batch size/time budget
-          DEBUG_LIST: "0"            # set "1" for verbose skip reasons
+          MAX_FILES_PER_RUN: "120"
+          DEBUG_LIST: "0"
         run: python /app/process_invoices.py
