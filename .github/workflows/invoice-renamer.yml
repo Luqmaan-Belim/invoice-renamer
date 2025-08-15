@@ -4,7 +4,7 @@ on:
   repository_dispatch:
     types: [drive_change]
   schedule:
-    - cron: "0,30 * * * *"   # optional safety net every 30 min
+    - cron: "0,30 * * * *"   # optional fallback
   workflow_dispatch: {}
 
 permissions:
@@ -13,14 +13,15 @@ permissions:
 
 concurrency:
   group: invoice-renamer-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false   # queue, don't cancel
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 6
     container:
-      image: ghcr.io/${{ github.repository }}/invoice-renamer:latest
+      # pull the exact same image you built above (all lowercase!)
+      image: ghcr.io/${{ toLower(github.repository) }}:latest
 
     steps:
       - uses: actions/checkout@v4
