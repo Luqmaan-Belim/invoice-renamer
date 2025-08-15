@@ -1,16 +1,21 @@
 name: drive_change
 
 on:
+  # Triggered by your Cloudflare Worker
   repository_dispatch:
     types: [drive_change]
+
+  # Optional fallback poll (remove if you don't want it)
   schedule:
-    - cron: "0,30 * * * *"   # optional fallback
+    - cron: "0,30 * * * *"
+
   workflow_dispatch: {}
 
 permissions:
   contents: read
   packages: read
 
+# Queue runs; never cancel one already in progress
 concurrency:
   group: invoice-renamer-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -19,13 +24,15 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 6
+
+    # Use the prebuilt image you pushed to GHCR (all lowercase path)
     container:
-      # pull the exact same image you built above (all lowercase!)
-      image: ghcr.io/${{ toLower(github.repository) }}:latest
+      image: ghcr.io/luqmaan-belim/invoice-renamer:latest
 
     steps:
       - uses: actions/checkout@v4
 
+      # Persist the Drive change token across runs (so we only see deltas)
       - name: Restore Drive change token
         id: token
         uses: actions/cache/restore@v4
@@ -35,14 +42,17 @@ jobs:
           restore-keys: |
             drive-token-v7-
 
-      - name: Process invoices (new-file only; 1 file)
+      - name: Process invoices (new-file only; one file max)
         env:
+          # Required
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          GRACE_SECONDS: "90"
-          NEW_WINDOW_SECONDS: "900"
-          MAX_FILES_PER_RUN: "1"
-          DEBUG_LIST: "0"
+
+          # Behaviour knobs
+          GRACE_SECONDS: "90"         # let uploads finish
+          NEW_WINDOW_SECONDS: "900"   # treat only last 15min as "new"
+          MAX_FILES_PER_RUN: "1"      # rename at most one file per run
+          DEBUG_LIST: "0"             # set "1" for verbose logs
         run: python3 /app/process_invoices.py
 
       - name: Save Drive change token
