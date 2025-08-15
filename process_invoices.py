@@ -2,16 +2,17 @@
 """
 Invoice Renamer — Rename ANY PDF whose name starts with 'IMG*' (case-insensitive)
 
-• Scans your target Drive root (including all subfolders) for PDFs named 'IMG*.pdf'.
-• Renames them based on OCR (first page). If no invoice number -> 'UNKNOWN_N.pdf'.
-• Skips items already final-looking (2025_123456.pdf or UNKNOWN_7.pdf) and stamps
-  appProperties.lb_renamed=1 so we don't touch them again.
-• Processes up to MAX_FILES_PER_RUN per job, newest first.
+• Scans your Drive root (and all subfolders) for PDFs named 'IMG*.pdf'.
+• OCRs page 1 (PyMuPDF render → Tesseract) to extract invoice number.
+• Renames to '<YYYY>_<number>.pdf' or 'UNKNOWN[_n].pdf' with uniqueness.
+• Skips already-final files (2025_123456.pdf or UNKNOWN_n.pdf) and stamps
+  appProperties.lb_renamed=1 so they aren't reprocessed again.
+• Processes up to MAX_FILES_PER_RUN per job (newest first).
 
 Env (GitHub Actions → env/secrets):
   GDRIVE_SA_JSON, GDRIVE_FOLDER_ID  (required)
   MAX_FILES_PER_RUN  (default 100)  # how many IMG*.pdf to handle per run
-  DEBUG_LIST         ("1" for verbose)
+  DEBUG_LIST         ("1" for verbose logs)
 
 Requires (pip):
   google-api-python-client, google-auth, google-auth-httplib2, google-auth-oauthlib
@@ -20,7 +21,6 @@ Requires (pip):
 
 import os, io, re, json, time, logging
 from typing import Optional, Tuple, Dict, List
-from datetime import datetime, timezone
 
 import numpy as np
 import cv2
@@ -41,13 +41,12 @@ DEBUG = os.environ.get("DEBUG_LIST", "0") == "1"
 MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "100"))
 
 PDF_MT = "application/pdf"
-FOLDER_MT = "application/vnd.google-apps.folder"
 SHORTCUT_MT = "application/vnd.google-apps.shortcut"
 
-RENAMED_RE = re.compile(r"^\d{4}_?\d{1,6}(?:_\d+)?\.pdf$", re.I)
-UNKNOWN_RE = re.compile(r"^UNKNOWN(?:_\d+)?\.pdf$", re.I)
+RENAMED_RE = re.compile(r"^\d{4}_?\d{1,6}(?:_\d+)?\.pdf$", re.I)   # e.g., 2025_123456.pdf or 2025_12.pdf
+UNKNOWN_RE = re.compile(r"^UNKNOWN(?:_\d+)?\.pdf$", re.I)          # e.g., UNKNOWN.pdf, UNKNOWN_3.pdf
 
-# ---------- helpers ----------
+# ---------- Drive helpers ----------
 def drive():
     creds = service_account.Credentials.from_service_account_info(
         SA_JSON, scopes=["https://www.googleapis.com/auth/drive"]
@@ -55,7 +54,7 @@ def drive():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def resolve_root(d, folder_id: str) -> Tuple[str, bool, Optional[str]]:
-    """Resolve if given ID is a shortcut; return (real_root_id, is_shared_drive, drive_id)."""
+    """Resolve shortcut if needed. Return (real_root_id, is_shared_drive, drive_id)."""
     meta = d.files().get(
         fileId=folder_id,
         fields="id,name,mimeType,driveId,shortcutDetails",
@@ -72,16 +71,8 @@ def resolve_root(d, folder_id: str) -> Tuple[str, bool, Optional[str]]:
                  meta.get("name"), meta.get("id"), bool(meta.get("driveId")), meta.get("driveId"))
     return meta["id"], bool(meta.get("driveId")), meta.get("driveId")
 
-def file_meta(d, fid: str) -> Dict:
-    return d.files().get(
-        fileId=fid,
-        fields=("id,name,mimeType,parents,driveId,trashed,appProperties,"
-                "createdTime,modifiedTime,capabilities(canRename,canEdit)"),
-        supportsAllDrives=True,
-    ).execute()
-
 def is_under_root(d, parents: List[str], root_id: str, cache: Dict[str, Optional[List[str]]]) -> bool:
-    """Ascend parents until we hit root_id; cache parent->parents lookups."""
+    """Ascend parents until root_id; cache lookups for speed."""
     if not parents:
         return False
     stack = list(parents)
@@ -102,8 +93,17 @@ def is_under_root(d, parents: List[str], root_id: str, cache: Dict[str, Optional
             stack.extend(p2)
     return False
 
+def file_meta(d, fid: str) -> Dict:
+    return d.files().get(
+        fileId=fid,
+        fields=("id,name,mimeType,parents,trashed,appProperties,"
+                "createdTime,modifiedTime,capabilities(canRename)"),
+        supportsAllDrives=True,
+    ).execute()
+
+# ---------- PDF → image ----------
 def download_first_page(d, file_id: str) -> Optional[np.ndarray]:
-    """Return RGB image (H,W,3) of first page at ~300 DPI using PyMuPDF."""
+    """Return RGB image (H,W,3) of page 1 at ~300 DPI using PyMuPDF."""
     buf = io.BytesIO()
     req = d.files().get_media(fileId=file_id)
     dl = MediaIoBaseDownload(buf, req)
@@ -123,6 +123,7 @@ def download_first_page(d, file_id: str) -> Optional[np.ndarray]:
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
         return img
 
+# ---------- OCR + cleaning ----------
 def ocr_with_confidence(image: np.ndarray):
     data = pytesseract.image_to_data(
         image, config="--psm 6 --oem 3", output_type=pytesseract.Output.DICT
@@ -135,16 +136,14 @@ def ocr_with_confidence(image: np.ndarray):
 def preprocess_image(image: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     gray = cv2.equalizeHist(gray)
-    return cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-    )
+    return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY, 11, 2)
 
 def extract_invoice_number(text: str) -> Optional[str]:
     m = re.search(r"(?:INV|NV)[^\d]*(\d{4}[^\d]*\d{1,6})", text, flags=re.I)
     if not m:
         return None
     s = m.group(1).strip()
-    # common OCR normalizations
     for k, v in {"A": "4", " ": "", "/": "_", "O": "0", "I": "1"}.items():
         s = s.replace(k, v)
     s = re.sub(r"[^\d_]", "", s)
@@ -154,6 +153,7 @@ def extract_invoice_number(text: str) -> Optional[str]:
         s = "_".join(parts)
     return s
 
+# ---------- rename helpers ----------
 def ensure_marked(d, fid):
     d.files().update(
         fileId=fid, body={"appProperties": {"lb_renamed": "1"}}, supportsAllDrives=True
@@ -195,13 +195,12 @@ def main():
     d = drive()
     root_id, is_shared, drive_id = resolve_root(d, FOLDER_ID)
 
-    # We list by "name contains 'IMG'" then post-filter startswith('IMG')
-    # and verify the file lives under our root (including subfolders).
     processed = 0
     parent_cache: Dict[str, Optional[List[str]]] = {}
 
     page_token = None
     while True:
+        # Find candidate PDFs that *contain* 'IMG' (API limitation); post-filter with startswith.
         q = "mimeType='application/pdf' and trashed=false and name contains 'IMG'"
         res = d.files().list(
             q=q,
@@ -219,32 +218,31 @@ def main():
             if processed >= MAX_FILES_PER_RUN:
                 break
 
-            if f.get("trashed"):
-                continue
-            if f.get("mimeType") != PDF_MT:
+            if f.get("trashed") or f.get("mimeType") != PDF_MT:
                 continue
 
             name = f.get("name", "")
             if not (name or "").upper().startswith("IMG"):
-                continue  # only IMG*.pdf
+                continue  # strict startswith for safety
 
-            # Already final-looking? mark once & skip
+            # skip already-final; mark once
             if RENAMED_RE.match(name or "") or UNKNOWN_RE.match(name or ""):
                 if (f.get("appProperties") or {}).get("lb_renamed") != "1":
                     ensure_marked(d, f["id"])
                 log_skip(name, "final-looking")
                 continue
 
-            # don't reprocess marked items
+            # already processed before?
             if (f.get("appProperties") or {}).get("lb_renamed") == "1":
                 continue
 
-            # Must live under our configured root
+            # must be under our configured root
             parents = f.get("parents") or []
             if not is_under_root(d, parents, root_id, parent_cache):
+                log_skip(name, "outside root")
                 continue
 
-            # Permission check
+            # permission check
             caps = f.get("capabilities") or {}
             if caps.get("canRename") is False:
                 log_skip(name, "no rename permission")
@@ -261,7 +259,6 @@ def main():
                 text, conf = ocr_with_confidence(preprocess_image(img))
 
             inv = extract_invoice_number(text) or "UNKNOWN"
-
             parent_id = parents[0] if parents else root_id
             new_name = unique_name_in_folder(d, parent_id, f"{inv}.pdf")
             if new_name == name:
