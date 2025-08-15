@@ -1,258 +1,35 @@
-#!/usr/bin/env python3
-"""
-Invoice Renamer — Traverse tree under GDRIVE_FOLDER_ID and rename any PDF
-whose filename starts with 'IMG' (case-insensitive), regardless of age.
+name: drive_change
 
-- Works on My Drive and Shared Drives (resolves shortcuts).
-- BFS traversal: lists children of each folder; recurses into subfolders.
-- Renames to '<YYYY>_<number>.pdf' if OCR finds INV/NV pattern, else 'UNKNOWN[_n].pdf'.
-- Skips already final-looking names and stamps appProperties.lb_renamed=1.
+on:
+  repository_dispatch:
+    types: [drive_change]
+  schedule:
+    - cron: "0,30 * * * *"
+  workflow_dispatch: {}
 
-Env:
-  GDRIVE_SA_JSON, GDRIVE_FOLDER_ID  (required)
-  MAX_FILES_PER_RUN  (default 120)
-  DEBUG_LIST         ("1" for verbose logs)
-"""
+permissions:
+  contents: read
+  packages: read
 
-import os, io, re, json, time, logging
-from typing import Optional, Dict, List, Tuple
-from collections import deque
+concurrency:
+  group: invoice-renamer-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
-import numpy as np
-import cv2
-import pytesseract
-import fitz  # PyMuPDF
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from google.oauth2 import service_account
+    container:
+      image: ghcr.io/luqmaan-belim/invoice-renamer:latest
 
-# ----------------- config -----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("invoice_renamer")
+    steps:
+      - uses: actions/checkout@v4
 
-FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"].strip()
-SA_JSON = json.loads(os.environ["GDRIVE_SA_JSON"])
-
-MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "120"))
-DEBUG = os.environ.get("DEBUG_LIST", "0") == "1"
-
-PDF_MT = "application/pdf"
-FOLDER_MT = "application/vnd.google-apps.folder"
-SHORTCUT_MT = "application/vnd.google-apps.shortcut"
-
-RENAMED_RE = re.compile(r"^\d{4}_?\d{1,6}(?:_\d+)?\.pdf$", re.I)
-UNKNOWN_RE = re.compile(r"^UNKNOWN(?:_\d+)?\.pdf$", re.I)
-
-# ----------------- drive helpers -----------------
-def drive():
-    creds = service_account.Credentials.from_service_account_info(
-        SA_JSON, scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-def resolve_root(d, folder_id: str) -> Tuple[str, bool, Optional[str]]:
-    """Return (real_root_id, is_shared_drive, drive_id). Resolve shortcuts."""
-    meta = d.files().get(
-        fileId=folder_id,
-        fields="id,name,mimeType,driveId,shortcutDetails",
-        supportsAllDrives=True,
-    ).execute()
-    if meta.get("mimeType") == SHORTCUT_MT:
-        tgt = meta["shortcutDetails"]["targetId"]
-        log.info("Resolved shortcut root: %s -> %s", folder_id, tgt)
-        meta = d.files().get(
-            fileId=tgt, fields="id,name,mimeType,driveId", supportsAllDrives=True
-        ).execute()
-    log.info(
-        "Root: %s (%s) SharedDrive=%s driveId=%s",
-        meta.get("name"), meta.get("id"), bool(meta.get("driveId")), meta.get("driveId"),
-    )
-    return meta["id"], bool(meta.get("driveId")), meta.get("driveId")
-
-def list_children(d, parent_id: str, is_shared: bool, drive_id: Optional[str]):
-    """Yield children of a folder (files + folders), paginated."""
-    page_token = None
-    while True:
-        q = f"'{parent_id}' in parents and trashed=false"
-        kwargs = dict(
-            q=q,
-            fields=("nextPageToken, files(id,name,mimeType,parents,trashed,"
-                    "appProperties,capabilities(canRename))"),
-            pageSize=200,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-            pageToken=page_token,
-            orderBy="name_natural"
-        )
-        res = d.files().list(**kwargs).execute()
-        for f in res.get("files", []):
-            yield f
-        page_token = res.get("nextPageToken")
-        if not page_token:
-            break
-
-def download_first_page(d, file_id: str) -> Optional[np.ndarray]:
-    """Return RGB image of first page (~300dpi) using PyMuPDF."""
-    buf = io.BytesIO()
-    req = d.files().get_media(fileId=file_id)
-    dl = MediaIoBaseDownload(buf, req)
-    done = False
-    while not done:
-        _, done = dl.next_chunk()
-    pdf_bytes = buf.getvalue()
-    if not pdf_bytes:
-        return None
-    zoom = 300 / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        if doc.page_count == 0:
-            return None
-        page = doc.load_page(0)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-        return img
-
-def ocr_with_confidence(image: np.ndarray):
-    data = pytesseract.image_to_data(
-        image, config="--psm 6 --oem 3", output_type=pytesseract.Output.DICT
-    )
-    text = " ".join([t for t in data.get("text", []) if t]).strip()
-    confs = [c for c in data.get("conf", []) if isinstance(c, (int, float)) and c != -1]
-    avg = sum(confs) / len(confs) if confs else 0.0
-    return text, avg
-
-def preprocess_image(image: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    gray = cv2.equalizeHist(gray)
-    return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                 cv2.THRESH_BINARY, 11, 2)
-
-def extract_invoice_number(text: str) -> Optional[str]:
-    m = re.search(r"(?:INV|NV)[^\d]*(\d{4}[^\d]*\d{1,6})", text, flags=re.I)
-    if not m:
-        return None
-    s = m.group(1).strip()
-    for k, v in {"A": "4", " ": "", "/": "_", "O": "0", "I": "1"}.items():
-        s = s.replace(k, v)
-    s = re.sub(r"[^\d_]", "", s)
-    parts = s.split("_")
-    if len(parts) == 2 and len(parts[1]) < 6:
-        parts[1] = parts[1].ljust(6, "0")
-        s = "_".join(parts)
-    return s
-
-def ensure_marked(d, fid):
-    d.files().update(fileId=fid, body={"appProperties": {"lb_renamed": "1"}},
-                     supportsAllDrives=True).execute()
-
-def unique_name_in_folder(d, folder_id: str, base: str) -> str:
-    name, n = base, 1
-    while True:
-        q = f"name = '{name}' and '{folder_id}' in parents and trashed=false"
-        res = d.files().list(
-            q=q, fields="files(id)", pageSize=1,
-            supportsAllDrives=True, includeItemsFromAllDrives=True
-        ).execute()
-        if not res.get("files"):
-            return name
-        root, ext = os.path.splitext(base)
-        name = f"{root}_{n}{ext}"
-        n += 1
-
-def safe_rename(d, fid: str, target_name: str) -> bool:
-    for _ in range(3):
-        d.files().update(
-            fileId=fid,
-            body={"name": target_name, "appProperties": {"lb_renamed": "1"}},
-            supportsAllDrives=True,
-        ).execute()
-        cur = d.files().get(fileId=fid, fields="name,appProperties", supportsAllDrives=True).execute()
-        if cur.get("name") == target_name:
-            return True
-        time.sleep(2)
-    return False
-
-def dlog(msg: str, *args):
-    if DEBUG:
-        log.info(msg, *args)
-
-# ----------------- main -----------------
-def main():
-    d = drive()
-    root_id, is_shared, drive_id = resolve_root(d, FOLDER_ID)
-
-    processed = 0
-    queue = deque([root_id])
-
-    dlog("Starting BFS from %s", root_id)
-
-    while queue and processed < MAX_FILES_PER_RUN:
-        folder_id = queue.popleft()
-        dlog("List children of folder %s", folder_id)
-
-        for item in list_children(d, folder_id, is_shared, drive_id):
-            if processed >= MAX_FILES_PER_RUN:
-                break
-
-            mt = item.get("mimeType")
-            name = item.get("name", "")
-            fid = item["id"]
-
-            if mt == FOLDER_MT:
-                queue.append(fid)
-                continue
-
-            if mt != PDF_MT:
-                continue
-
-            # Only IMG*.pdf (case-insensitive)
-            if not name.upper().startswith("IMG"):
-                continue
-
-            # Skip already final-looking; mark once
-            if RENAMED_RE.match(name) or UNKNOWN_RE.match(name):
-                if (item.get("appProperties") or {}).get("lb_renamed") != "1":
-                    ensure_marked(d, fid)
-                dlog("SKIP final-looking %s", name)
-                continue
-
-            if (item.get("appProperties") or {}).get("lb_renamed") == "1":
-                dlog("SKIP already marked %s", name)
-                continue
-
-            # Permission check
-            caps = item.get("capabilities") or {}
-            if caps.get("canRename") is False:
-                dlog("SKIP no rename permission %s", name)
-                continue
-
-            # OCR page 1
-            img = download_first_page(d, fid)
-            if img is None:
-                dlog("SKIP no image %s", name)
-                continue
-
-            text, conf = ocr_with_confidence(img)
-            if conf < 40:
-                text, conf = ocr_with_confidence(preprocess_image(img))
-
-            inv = extract_invoice_number(text) or "UNKNOWN"
-
-            parent_id = (item.get("parents") or [folder_id])[0]
-            new_name = unique_name_in_folder(d, parent_id, f"{inv}.pdf")
-            if new_name == name:
-                ensure_marked(d, fid)
-                dlog("SKIP already correct %s", name)
-                continue
-
-            if safe_rename(d, fid, new_name):
-                processed += 1
-                log.info("RENAMED %s -> %s", name, new_name)
-            else:
-                log.warning("FAILED RENAME %s -> %s", name, new_name)
-
-    log.info("Processed %d file(s) this run.", processed)
-
-if __name__ == "__main__":
-    main()
+      - name: Process IMG*.pdf files (batch rename)
+        env:
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          MAX_FILES_PER_RUN: "120"
+          DEBUG_LIST: "1"
+        run: python process_invoices.py
