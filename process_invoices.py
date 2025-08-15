@@ -1,26 +1,15 @@
 #!/usr/bin/env python3
 """
-Invoice Renamer — Rename ANY PDF whose name starts with 'IMG*' (case-insensitive)
+Traverse the tree under GDRIVE_FOLDER_ID and rename any PDF whose filename
+starts with 'IMG' (case-insensitive). Works for My Drive and Shared Drives.
 
-• Scans your Drive root (and all subfolders) for PDFs named 'IMG*.pdf'.
-• OCRs page 1 (PyMuPDF render → Tesseract) to extract invoice number.
-• Renames to '<YYYY>_<number>.pdf' or 'UNKNOWN[_n].pdf' with uniqueness.
-• Skips already-final files (2025_123456.pdf or UNKNOWN_n.pdf) and stamps
-  appProperties.lb_renamed=1 so they aren't reprocessed again.
-• Processes up to MAX_FILES_PER_RUN per job (newest first).
-
-Env (GitHub Actions → env/secrets):
-  GDRIVE_SA_JSON, GDRIVE_FOLDER_ID  (required)
-  MAX_FILES_PER_RUN  (default 100)  # how many IMG*.pdf to handle per run
-  DEBUG_LIST         ("1" for verbose logs)
-
-Requires (pip):
-  google-api-python-client, google-auth, google-auth-httplib2, google-auth-oauthlib
-  pytesseract, PyMuPDF, opencv-python-headless, numpy, Pillow
+Batch size: MAX_FILES_PER_RUN (default 120)
+Verbose traversal logs when DEBUG_LIST="1"
 """
 
 import os, io, re, json, time, logging
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Dict, List, Tuple
+from collections import deque
 
 import numpy as np
 import cv2
@@ -31,22 +20,24 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
 
-# ---------- config ----------
+# ----------------- config -----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("invoice_renamer")
 
 FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"].strip()
 SA_JSON = json.loads(os.environ["GDRIVE_SA_JSON"])
+
+MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "120"))
 DEBUG = os.environ.get("DEBUG_LIST", "0") == "1"
-MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "100"))
 
 PDF_MT = "application/pdf"
+FOLDER_MT = "application/vnd.google-apps.folder"
 SHORTCUT_MT = "application/vnd.google-apps.shortcut"
 
-RENAMED_RE = re.compile(r"^\d{4}_?\d{1,6}(?:_\d+)?\.pdf$", re.I)   # e.g., 2025_123456.pdf or 2025_12.pdf
-UNKNOWN_RE = re.compile(r"^UNKNOWN(?:_\d+)?\.pdf$", re.I)          # e.g., UNKNOWN.pdf, UNKNOWN_3.pdf
+RENAMED_RE = re.compile(r"^\d{4}_?\d{1,6}(?:_\d+)?\.pdf$", re.I)
+UNKNOWN_RE = re.compile(r"^UNKNOWN(?:_\d+)?\.pdf$", re.I)
 
-# ---------- Drive helpers ----------
+# ----------------- drive helpers -----------------
 def drive():
     creds = service_account.Credentials.from_service_account_info(
         SA_JSON, scopes=["https://www.googleapis.com/auth/drive"]
@@ -54,7 +45,7 @@ def drive():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def resolve_root(d, folder_id: str) -> Tuple[str, bool, Optional[str]]:
-    """Resolve shortcut if needed. Return (real_root_id, is_shared_drive, drive_id)."""
+    """Return (real_root_id, is_shared_drive, drive_id). Resolve shortcuts."""
     meta = d.files().get(
         fileId=folder_id,
         fields="id,name,mimeType,driveId,shortcutDetails",
@@ -66,44 +57,48 @@ def resolve_root(d, folder_id: str) -> Tuple[str, bool, Optional[str]]:
         meta = d.files().get(
             fileId=tgt, fields="id,name,mimeType,driveId", supportsAllDrives=True
         ).execute()
-    if DEBUG:
-        log.info("Root: %s (%s) SharedDrive=%s driveId=%s",
-                 meta.get("name"), meta.get("id"), bool(meta.get("driveId")), meta.get("driveId"))
+    log.info(
+        "INFO Root: Drive (%s) SharedDrive=%s driveId=%s",
+        meta.get("name"), bool(meta.get("driveId")), meta.get("driveId"),
+    )
     return meta["id"], bool(meta.get("driveId")), meta.get("driveId")
 
-def is_under_root(d, parents: List[str], root_id: str, cache: Dict[str, Optional[List[str]]]) -> bool:
-    """Ascend parents until root_id; cache lookups for speed."""
-    if not parents:
-        return False
-    stack = list(parents)
-    while stack:
-        pid = stack.pop()
-        if pid == root_id:
-            return True
-        if pid in cache:
-            p2 = cache[pid]
-        else:
-            try:
-                md = d.files().get(fileId=pid, fields="id,parents", supportsAllDrives=True).execute()
-                p2 = md.get("parents") or []
-            except Exception:
-                p2 = []
-            cache[pid] = p2 if p2 else None
-        if p2:
-            stack.extend(p2)
-    return False
+def list_children(d, parent_id: str, is_shared: bool, drive_id: Optional[str]):
+    """
+    Yield children of a folder (files + folders), paginated.
+    IMPORTANT: for Shared Drives we must set corpora='drive' and driveId=<id>.
+    """
+    page_token = None
+    total = 0
+    while True:
+        q = f"'{parent_id}' in parents and trashed=false"
+        kwargs = dict(
+            q=q,
+            fields=("nextPageToken, files(id,name,mimeType,parents,trashed,"
+                    "appProperties,capabilities(canRename))"),
+            pageSize=200,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+            pageToken=page_token,
+            orderBy="name_natural",
+        )
+        if is_shared and drive_id:
+            kwargs["corpora"] = "drive"
+            kwargs["driveId"] = drive_id
 
-def file_meta(d, fid: str) -> Dict:
-    return d.files().get(
-        fileId=fid,
-        fields=("id,name,mimeType,parents,trashed,appProperties,"
-                "createdTime,modifiedTime,capabilities(canRename)"),
-        supportsAllDrives=True,
-    ).execute()
+        res = d.files().list(**kwargs).execute()
+        files = res.get("files", [])
+        total += len(files)
+        for f in files:
+            yield f
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    if DEBUG:
+        log.info("DEBUG list_children('%s') -> %d items", parent_id, total)
 
-# ---------- PDF → image ----------
 def download_first_page(d, file_id: str) -> Optional[np.ndarray]:
-    """Return RGB image (H,W,3) of page 1 at ~300 DPI using PyMuPDF."""
+    """Return RGB image of first page (~300dpi) using PyMuPDF."""
     buf = io.BytesIO()
     req = d.files().get_media(fileId=file_id)
     dl = MediaIoBaseDownload(buf, req)
@@ -123,7 +118,6 @@ def download_first_page(d, file_id: str) -> Optional[np.ndarray]:
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
         return img
 
-# ---------- OCR + cleaning ----------
 def ocr_with_confidence(image: np.ndarray):
     data = pytesseract.image_to_data(
         image, config="--psm 6 --oem 3", output_type=pytesseract.Output.DICT
@@ -136,8 +130,9 @@ def ocr_with_confidence(image: np.ndarray):
 def preprocess_image(image: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     gray = cv2.equalizeHist(gray)
-    return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                 cv2.THRESH_BINARY, 11, 2)
+    return cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+    )
 
 def extract_invoice_number(text: str) -> Optional[str]:
     m = re.search(r"(?:INV|NV)[^\d]*(\d{4}[^\d]*\d{1,6})", text, flags=re.I)
@@ -153,7 +148,6 @@ def extract_invoice_number(text: str) -> Optional[str]:
         s = "_".join(parts)
     return s
 
-# ---------- rename helpers ----------
 def ensure_marked(d, fid):
     d.files().update(
         fileId=fid, body={"appProperties": {"lb_renamed": "1"}}, supportsAllDrives=True
@@ -186,72 +180,67 @@ def safe_rename(d, fid: str, target_name: str) -> bool:
         time.sleep(2)
     return False
 
-def log_skip(name: str, reason: str):
+def dlog(msg: str, *args):
     if DEBUG:
-        log.info("SKIP %-28s %s", name or "(no-name)", reason)
+        log.info("DEBUG " + msg, *args)
 
-# ---------- main ----------
+# ----------------- main -----------------
 def main():
     d = drive()
     root_id, is_shared, drive_id = resolve_root(d, FOLDER_ID)
 
     processed = 0
-    parent_cache: Dict[str, Optional[List[str]]] = {}
+    queue = deque([root_id])
+    seen_folders = set()
 
-    page_token = None
-    while True:
-        # Find candidate PDFs that *contain* 'IMG' (API limitation); post-filter with startswith.
-        q = "mimeType='application/pdf' and trashed=false and name contains 'IMG'"
-        res = d.files().list(
-            q=q,
-            fields=("nextPageToken, files("
-                    "id,name,mimeType,parents,trashed,appProperties,"
-                    "createdTime,modifiedTime,capabilities(canRename))"),
-            pageSize=200,
-            pageToken=page_token,
-            orderBy="createdTime desc",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        ).execute()
+    dlog("Starting BFS from %s (shared=%s driveId=%s)", root_id, is_shared, drive_id)
 
-        for f in res.get("files", []):
+    while queue and processed < MAX_FILES_PER_RUN:
+        folder_id = queue.popleft()
+        if folder_id in seen_folders:
+            continue
+        seen_folders.add(folder_id)
+
+        dlog("Listing children of folder %s ...", folder_id)
+        child_count = 0
+
+        for item in list_children(d, folder_id, is_shared, drive_id):
+            child_count += 1
             if processed >= MAX_FILES_PER_RUN:
                 break
 
-            if f.get("trashed") or f.get("mimeType") != PDF_MT:
+            mt = item.get("mimeType")
+            name = item.get("name", "")
+            fid = item["id"]
+
+            if mt == FOLDER_MT:
+                queue.append(fid)
                 continue
 
-            name = f.get("name", "")
-            if not (name or "").upper().startswith("IMG"):
-                continue  # strict startswith for safety
-
-            # skip already-final; mark once
-            if RENAMED_RE.match(name or "") or UNKNOWN_RE.match(name or ""):
-                if (f.get("appProperties") or {}).get("lb_renamed") != "1":
-                    ensure_marked(d, f["id"])
-                log_skip(name, "final-looking")
+            if mt != PDF_MT:
                 continue
 
-            # already processed before?
-            if (f.get("appProperties") or {}).get("lb_renamed") == "1":
+            if not name.upper().startswith("IMG"):
                 continue
 
-            # must be under our configured root
-            parents = f.get("parents") or []
-            if not is_under_root(d, parents, root_id, parent_cache):
-                log_skip(name, "outside root")
+            if RENAMED_RE.match(name) or UNKNOWN_RE.match(name):
+                if (item.get("appProperties") or {}).get("lb_renamed") != "1":
+                    ensure_marked(d, fid)
+                dlog("skip final-looking %s", name)
                 continue
 
-            # permission check
-            caps = f.get("capabilities") or {}
+            if (item.get("appProperties") or {}).get("lb_renamed") == "1":
+                dlog("skip already-marked %s", name)
+                continue
+
+            caps = item.get("capabilities") or {}
             if caps.get("canRename") is False:
-                log_skip(name, "no rename permission")
+                dlog("skip no-rename-permission %s", name)
                 continue
 
-            # OCR first page
-            img = download_first_page(d, f["id"])
+            img = download_first_page(d, fid)
             if img is None:
-                log_skip(name, "no image")
+                dlog("skip no-image %s", name)
                 continue
 
             text, conf = ocr_with_confidence(img)
@@ -259,25 +248,21 @@ def main():
                 text, conf = ocr_with_confidence(preprocess_image(img))
 
             inv = extract_invoice_number(text) or "UNKNOWN"
-            parent_id = parents[0] if parents else root_id
+
+            parent_id = (item.get("parents") or [folder_id])[0]
             new_name = unique_name_in_folder(d, parent_id, f"{inv}.pdf")
             if new_name == name:
-                ensure_marked(d, f["id"])
-                log_skip(name, "already correct")
+                ensure_marked(d, fid)
+                dlog("skip already-correct %s", name)
                 continue
 
-            if safe_rename(d, f["id"], new_name):
+            if safe_rename(d, fid, new_name):
                 processed += 1
                 log.info("RENAMED %s -> %s", name, new_name)
             else:
                 log.warning("FAILED RENAME %s -> %s", name, new_name)
 
-        if processed >= MAX_FILES_PER_RUN:
-            break
-
-        page_token = res.get("nextPageToken")
-        if not page_token:
-            break
+        dlog("Folder %s had %d direct children", folder_id, child_count)
 
     log.info("Processed %d file(s) this run.", processed)
 
