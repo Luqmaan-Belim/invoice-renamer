@@ -1,20 +1,11 @@
 #!/usr/bin/env python3
 """
-Invoice Renamer — Drive Changes API + PyMuPDF + one-new-file-per-run
+Invoice Renamer — Drive Changes API + PyMuPDF, ONE new file per run
 
-Behavior:
-- Only acts on PDFs created very recently (NEW_WINDOW_SECONDS).
-- Renames at most one file per run (MAX_FILES_PER_RUN = 1).
-- Works under a target root (including subfolders), My Drive or Shared Drive.
-- Verifies rename, retries, and stamps appProperties.lb_renamed=1.
-- Skips files already looking final: 2025_123456.pdf or UNKNOWN_7.pdf.
-
-Env:
-  GDRIVE_SA_JSON, GDRIVE_FOLDER_ID  (required)
-  NEW_WINDOW_SECONDS (default 900)
-  GRACE_SECONDS      (default 90)
-  MAX_FILES_PER_RUN  (default 1)
-  DEBUG_LIST         ("1" for verbose)
+• Only acts on PDFs created within NEW_WINDOW_SECONDS (default 15 min)
+• Renames at most ONE file per run (MAX_FILES_PER_RUN=1)
+• Verifies rename and stamps appProperties.lb_renamed=1
+• Skips anything already final (2025_123456.pdf or UNKNOWN_7.pdf)
 """
 
 import os, io, re, json, time, logging, pathlib
@@ -38,8 +29,8 @@ FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"].strip()
 SA_JSON = json.loads(os.environ["GDRIVE_SA_JSON"])
 DEBUG = os.environ.get("DEBUG_LIST", "0") == "1"
 GRACE_SECONDS = int(os.environ.get("GRACE_SECONDS", "90"))
-NEW_WINDOW_SECONDS = int(os.environ.get("NEW_WINDOW_SECONDS", "900"))
-MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "1"))
+NEW_WINDOW_SECONDS = int(os.environ.get("NEW_WINDOW_SECONDS", "900"))  # 15 min
+MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "1"))     # ONE file
 
 TOKEN_PATH = pathlib.Path(".drive_change_token")
 
@@ -153,8 +144,7 @@ def unique_name_in_folder(d, folder_id: str, base: str) -> str:
         n += 1
 
 def ensure_marked(d, fid):
-    d.files().update(fileId=fid,
-                     body={"appProperties": {"lb_renamed": "1"}},
+    d.files().update(fileId=fid, body={"appProperties": {"lb_renamed": "1"}},
                      supportsAllDrives=True).execute()
 
 def safe_rename(d, fid: str, target_name: str) -> bool:
@@ -165,9 +155,7 @@ def safe_rename(d, fid: str, target_name: str) -> bool:
         cur = d.files().get(fileId=fid, fields="name,appProperties", supportsAllDrives=True).execute()
         if cur.get("name") == target_name:
             return True
-        log.warning("Rename bounce (attempt %d). Current=%s Wanted=%s",
-                    attempt, cur.get("name"), target_name)
-        time.sleep(3)
+        time.sleep(2)
     return False
 
 def ocr_with_confidence(image: np.ndarray):
@@ -224,6 +212,7 @@ def main():
                       includeItemsFromAllDrives=True, supportsAllDrives=True)
         if is_shared and drive_id:
             kwargs.update(driveId=drive_id)
+
         resp = d.changes().list(**kwargs).execute()
 
         for ch in resp.get("changes", []):
@@ -231,28 +220,23 @@ def main():
                 continue
             fobj = ch.get("file") or {}
             fid = ch.get("fileId")
-            if not fid or not fobj:
+            if not fid or not fobj:  # corrupted event
                 continue
 
-            if fobj.get("trashed"):
-                continue
-            if fobj.get("mimeType") != PDF_MT:
+            if fobj.get("trashed") or fobj.get("mimeType") != PDF_MT:
                 continue
 
             name = fobj.get("name", "")
+            # already final? mark & skip
             if RENAMED_RE.match(name or "") or UNKNOWN_RE.match(name or ""):
-                props = fobj.get("appProperties") or {}
-                if props.get("lb_renamed") != "1":
+                if (fobj.get("appProperties") or {}).get("lb_renamed") != "1":
                     ensure_marked(d, fid)
-                    log_skip(name, "final-looking name; marked")
                 continue
 
-            props = fobj.get("appProperties") or {}
-            if props.get("lb_renamed") == "1":
+            if (fobj.get("appProperties") or {}).get("lb_renamed") == "1":
                 continue
 
-            caps = fobj.get("capabilities") or {}
-            if caps and not caps.get("canRename", True):
+            if (fobj.get("capabilities") or {}).get("canRename") is False:
                 log_skip(name, "no rename permission")
                 continue
 
@@ -266,14 +250,13 @@ def main():
                 created = created or (meta.get("createdTime") or meta.get("modifiedTime"))
                 name = name or meta.get("name", "")
 
-            # Only brand-new files
             created_dt = iso_to_dt(created)
             age = (now - created_dt).total_seconds()
+
+            # new-file only window
             if age > NEW_WINDOW_SECONDS:
-                log_skip(name, f"older than NEW_WINDOW_SECONDS ({int(age)}s)")
                 continue
             if age < GRACE_SECONDS:
-                log_skip(name, f"too new {int(age)}s < GRACE_SECONDS {GRACE_SECONDS}s")
                 continue
 
             if not is_under_root(d, parents, root_id, parent_cache):
@@ -281,7 +264,6 @@ def main():
 
             img = download_first_page(d, fid)
             if img is None:
-                log_skip(name, "no image")
                 continue
 
             text, conf = ocr_with_confidence(img)
@@ -291,7 +273,6 @@ def main():
             inv = extract_invoice_number(text) or "UNKNOWN"
             if inv == "UNKNOWN" and UNKNOWN_RE.match(name or ""):
                 ensure_marked(d, fid)
-                log_skip(name, "unknown & already UNKNOWN_*; marked")
                 continue
 
             parent_id = parents[0] if parents else root_id
@@ -303,14 +284,12 @@ def main():
             if safe_rename(d, fid, new_name):
                 processed += 1
                 log.info("RENAMED %s -> %s", name, new_name)
-            else:
-                log.error("FAILED RENAME %s -> %s", name, new_name)
 
-            if MAX_FILES_PER_RUN and processed >= MAX_FILES_PER_RUN:
+            if processed >= MAX_FILES_PER_RUN:
                 break
 
         token = resp.get("nextPageToken")
-        if not token or (MAX_FILES_PER_RUN and processed >= MAX_FILES_PER_RUN):
+        if not token or processed >= MAX_FILES_PER_RUN:
             next_token = resp.get("newStartPageToken") or token
             break
 
