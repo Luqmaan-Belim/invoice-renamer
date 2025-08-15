@@ -1,9 +1,12 @@
-google-api-python-client
-google-auth
-google-auth-httplib2
-google-auth-oauthlib
-pytesseract
-PyMuPDF
-opencv-python-headless
-numpy
-Pillow
+# Google / auth
+google-api-python-client==2.137.0
+google-auth==2.33.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
+
+# OCR + PDF + image libs
+pytesseract==0.3.10
+PyMuPDF==1.24.9
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+Pillow==10.4.0
