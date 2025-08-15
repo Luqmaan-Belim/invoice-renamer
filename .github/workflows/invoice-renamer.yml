@@ -1,33 +1,41 @@
-name: Invoice Renamer (Changes API)
+name: drive_change
 
 on:
-  workflow_dispatch:
+  # Triggered by your Cloudflare Worker
   repository_dispatch:
     types: [drive_change]
+
+  # Optional periodic sweep (remove if not needed)
+  schedule:
+    - cron: "0,30 * * * *"
+
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: read
+
+# Queue runs; don't cancel in-progress jobs
+concurrency:
+  group: invoice-renamer-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # Use your prebuilt image (lowercase path). If you used my earlier build workflow:
+    container:
+      image: ghcr.io/${{ toLower(github.repository) }}:latest
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr poppler-utils libgl1
-
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
-      - name: Process invoices (IMG* only)
+      - name: Process IMG*.pdf files (batch rename)
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          MAX_FILES_PER_RUN: "100"   # process up to 100 files in one run
-          DEBUG_LIST: "1"
-        run: python3 process_invoices.py
+          MAX_FILES_PER_RUN: "120"   # adjust to suit your batch size/time budget
+          DEBUG_LIST: "0"            # set "1" for verbose skip reasons
+        run: python /app/process_invoices.py
