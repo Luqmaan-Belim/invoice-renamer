@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Invoice Renamer — Drive Changes API (NEW uploads only)
+Invoice Renamer — Rename ANY PDF whose name starts with 'IMG*' (case-insensitive)
 
-• Skips deletions/trashed.
-• Only processes PDFs whose createdTime is within NEW_WINDOW_SECONDS (default 15 min)
-  and older than GRACE_SECONDS (default 90s) -> i.e., truly NEW uploads.
-• Renames at most ONE file per run (MAX_FILES_PER_RUN=1 by default).
-• Verifies rename and stamps appProperties.lb_renamed=1 so we never re-touch it.
-• Ignores files already final-looking (2025_123456.pdf or UNKNOWN_7.pdf).
+• Scans your target Drive root (including all subfolders) for PDFs named 'IMG*.pdf'.
+• Renames them based on OCR (first page). If no invoice number -> 'UNKNOWN_N.pdf'.
+• Skips items already final-looking (2025_123456.pdf or UNKNOWN_7.pdf) and stamps
+  appProperties.lb_renamed=1 so we don't touch them again.
+• Processes up to MAX_FILES_PER_RUN per job, newest first.
 
 Env (GitHub Actions → env/secrets):
   GDRIVE_SA_JSON, GDRIVE_FOLDER_ID  (required)
-  NEW_WINDOW_SECONDS (default 900)
-  GRACE_SECONDS      (default 90)
-  MAX_FILES_PER_RUN  (default 1)
+  MAX_FILES_PER_RUN  (default 100)  # how many IMG*.pdf to handle per run
   DEBUG_LIST         ("1" for verbose)
+
+Requires (pip):
+  google-api-python-client, google-auth, google-auth-httplib2, google-auth-oauthlib
+  pytesseract, PyMuPDF, opencv-python-headless, numpy, Pillow
 """
 
-import os, io, re, json, time, logging, pathlib
+import os, io, re, json, time, logging
 from typing import Optional, Tuple, Dict, List
 from datetime import datetime, timezone
 
@@ -37,25 +38,16 @@ log = logging.getLogger("invoice_renamer")
 FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"].strip()
 SA_JSON = json.loads(os.environ["GDRIVE_SA_JSON"])
 DEBUG = os.environ.get("DEBUG_LIST", "0") == "1"
-GRACE_SECONDS = int(os.environ.get("GRACE_SECONDS", "90"))
-NEW_WINDOW_SECONDS = int(os.environ.get("NEW_WINDOW_SECONDS", "900"))  # 15 min
-MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "1"))     # ONE file
-
-TOKEN_PATH = pathlib.Path(".drive_change_token")
+MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "100"))
 
 PDF_MT = "application/pdf"
+FOLDER_MT = "application/vnd.google-apps.folder"
 SHORTCUT_MT = "application/vnd.google-apps.shortcut"
+
 RENAMED_RE = re.compile(r"^\d{4}_?\d{1,6}(?:_\d+)?\.pdf$", re.I)
 UNKNOWN_RE = re.compile(r"^UNKNOWN(?:_\d+)?\.pdf$", re.I)
 
 # ---------- helpers ----------
-def iso_to_dt(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-def log_skip(name: str, reason: str):
-    if DEBUG:
-        log.info("SKIP %-24s %s", (name or "(no-name)"), reason)
-
 def drive():
     creds = service_account.Credentials.from_service_account_info(
         SA_JSON, scopes=["https://www.googleapis.com/auth/drive"]
@@ -63,6 +55,7 @@ def drive():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def resolve_root(d, folder_id: str) -> Tuple[str, bool, Optional[str]]:
+    """Resolve if given ID is a shortcut; return (real_root_id, is_shared_drive, drive_id)."""
     meta = d.files().get(
         fileId=folder_id,
         fields="id,name,mimeType,driveId,shortcutDetails",
@@ -71,25 +64,13 @@ def resolve_root(d, folder_id: str) -> Tuple[str, bool, Optional[str]]:
     if meta.get("mimeType") == SHORTCUT_MT:
         tgt = meta["shortcutDetails"]["targetId"]
         log.info("Resolved shortcut root: %s -> %s", folder_id, tgt)
-        meta = d.files().get(fileId=tgt, fields="id,name,mimeType,driveId", supportsAllDrives=True).execute()
+        meta = d.files().get(
+            fileId=tgt, fields="id,name,mimeType,driveId", supportsAllDrives=True
+        ).execute()
     if DEBUG:
         log.info("Root: %s (%s) SharedDrive=%s driveId=%s",
                  meta.get("name"), meta.get("id"), bool(meta.get("driveId")), meta.get("driveId"))
     return meta["id"], bool(meta.get("driveId")), meta.get("driveId")
-
-def get_start_token(d, is_shared: bool, drive_id: Optional[str]) -> str:
-    if is_shared and drive_id:
-        return d.changes().getStartPageToken(driveId=drive_id, supportsAllDrives=True).execute()["startPageToken"]
-    return d.changes().getStartPageToken().execute()["startPageToken"]
-
-def load_token() -> Optional[str]:
-    try:
-        return TOKEN_PATH.read_text().strip() or None
-    except FileNotFoundError:
-        return None
-
-def save_token(t: str):
-    TOKEN_PATH.write_text(t)
 
 def file_meta(d, fid: str) -> Dict:
     return d.files().get(
@@ -100,6 +81,7 @@ def file_meta(d, fid: str) -> Dict:
     ).execute()
 
 def is_under_root(d, parents: List[str], root_id: str, cache: Dict[str, Optional[List[str]]]) -> bool:
+    """Ascend parents until we hit root_id; cache parent->parents lookups."""
     if not parents:
         return False
     stack = list(parents)
@@ -121,6 +103,7 @@ def is_under_root(d, parents: List[str], root_id: str, cache: Dict[str, Optional
     return False
 
 def download_first_page(d, file_id: str) -> Optional[np.ndarray]:
+    """Return RGB image (H,W,3) of first page at ~300 DPI using PyMuPDF."""
     buf = io.BytesIO()
     req = d.files().get_media(fileId=file_id)
     dl = MediaIoBaseDownload(buf, req)
@@ -140,36 +123,10 @@ def download_first_page(d, file_id: str) -> Optional[np.ndarray]:
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
         return img
 
-def unique_name_in_folder(d, folder_id: str, base: str) -> str:
-    name, n = base, 1
-    while True:
-        q = f"name = '{name}' and '{folder_id}' in parents and trashed=false"
-        res = d.files().list(q=q, fields="files(id)", pageSize=1,
-                             supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-        if not res.get("files"):
-            return name
-        root, ext = os.path.splitext(base)
-        name = f"{root}_{n}{ext}"
-        n += 1
-
-def ensure_marked(d, fid):
-    d.files().update(fileId=fid, body={"appProperties": {"lb_renamed": "1"}},
-                     supportsAllDrives=True).execute()
-
-def safe_rename(d, fid: str, target_name: str) -> bool:
-    for _ in range(3):
-        d.files().update(fileId=fid,
-                         body={"name": target_name, "appProperties": {"lb_renamed": "1"}},
-                         supportsAllDrives=True).execute()
-        cur = d.files().get(fileId=fid, fields="name,appProperties", supportsAllDrives=True).execute()
-        if cur.get("name") == target_name:
-            return True
-        time.sleep(2)
-    return False
-
 def ocr_with_confidence(image: np.ndarray):
-    data = pytesseract.image_to_data(image, config="--psm 6 --oem 3",
-                                     output_type=pytesseract.Output.DICT)
+    data = pytesseract.image_to_data(
+        image, config="--psm 6 --oem 3", output_type=pytesseract.Output.DICT
+    )
     text = " ".join([t for t in data.get("text", []) if t]).strip()
     confs = [c for c in data.get("conf", []) if isinstance(c, (int, float)) and c != -1]
     avg = sum(confs) / len(confs) if confs else 0.0
@@ -178,14 +135,16 @@ def ocr_with_confidence(image: np.ndarray):
 def preprocess_image(image: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     gray = cv2.equalizeHist(gray)
-    return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                 cv2.THRESH_BINARY, 11, 2)
+    return cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+    )
 
 def extract_invoice_number(text: str) -> Optional[str]:
     m = re.search(r"(?:INV|NV)[^\d]*(\d{4}[^\d]*\d{1,6})", text, flags=re.I)
     if not m:
         return None
     s = m.group(1).strip()
+    # common OCR normalizations
     for k, v in {"A": "4", " ": "", "/": "_", "O": "0", "I": "1"}.items():
         s = s.replace(k, v)
     s = re.sub(r"[^\d_]", "", s)
@@ -195,97 +154,104 @@ def extract_invoice_number(text: str) -> Optional[str]:
         s = "_".join(parts)
     return s
 
+def ensure_marked(d, fid):
+    d.files().update(
+        fileId=fid, body={"appProperties": {"lb_renamed": "1"}}, supportsAllDrives=True
+    ).execute()
+
+def unique_name_in_folder(d, folder_id: str, base: str) -> str:
+    name, n = base, 1
+    while True:
+        q = f"name = '{name}' and '{folder_id}' in parents and trashed=false"
+        res = d.files().list(
+            q=q, fields="files(id)", pageSize=1,
+            supportsAllDrives=True, includeItemsFromAllDrives=True
+        ).execute()
+        if not res.get("files"):
+            return name
+        root, ext = os.path.splitext(base)
+        name = f"{root}_{n}{ext}"
+        n += 1
+
+def safe_rename(d, fid: str, target_name: str) -> bool:
+    for _ in range(3):
+        d.files().update(
+            fileId=fid,
+            body={"name": target_name, "appProperties": {"lb_renamed": "1"}},
+            supportsAllDrives=True,
+        ).execute()
+        cur = d.files().get(fileId=fid, fields="name,appProperties", supportsAllDrives=True).execute()
+        if cur.get("name") == target_name:
+            return True
+        time.sleep(2)
+    return False
+
+def log_skip(name: str, reason: str):
+    if DEBUG:
+        log.info("SKIP %-28s %s", name or "(no-name)", reason)
+
 # ---------- main ----------
 def main():
     d = drive()
     root_id, is_shared, drive_id = resolve_root(d, FOLDER_ID)
 
-    token = load_token()
-    if not token:
-        token = get_start_token(d, is_shared, drive_id)
-        save_token(token)
-        log.info("Initialized change token.")
-        return
-
-    parent_cache: Dict[str, Optional[List[str]]] = {}
+    # We list by "name contains 'IMG'" then post-filter startswith('IMG')
+    # and verify the file lives under our root (including subfolders).
     processed = 0
-    next_token = None
-    now = datetime.now(timezone.utc)
+    parent_cache: Dict[str, Optional[List[str]]] = {}
 
+    page_token = None
     while True:
-        fields = ("nextPageToken,newStartPageToken,"
-                  "changes(fileId,removed,"
-                  "file(id,name,mimeType,parents,driveId,trashed,appProperties,"
-                  "createdTime,modifiedTime,capabilities))")
-        kwargs = dict(pageToken=token, fields=fields,
-                      includeItemsFromAllDrives=True, supportsAllDrives=True)
-        if is_shared and drive_id:
-            kwargs.update(driveId=drive_id)
+        q = "mimeType='application/pdf' and trashed=false and name contains 'IMG'"
+        res = d.files().list(
+            q=q,
+            fields=("nextPageToken, files("
+                    "id,name,mimeType,parents,trashed,appProperties,"
+                    "createdTime,modifiedTime,capabilities(canRename))"),
+            pageSize=200,
+            pageToken=page_token,
+            orderBy="createdTime desc",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
 
-        resp = d.changes().list(**kwargs).execute()
+        for f in res.get("files", []):
+            if processed >= MAX_FILES_PER_RUN:
+                break
 
-        for ch in resp.get("changes", []):
-            # 1) NEVER act on deletions
-            if ch.get("removed", False):
+            if f.get("trashed"):
+                continue
+            if f.get("mimeType") != PDF_MT:
                 continue
 
-            fobj = ch.get("file") or {}
-            fid = ch.get("fileId")
-            if not fid or not fobj:
-                continue
+            name = f.get("name", "")
+            if not (name or "").upper().startswith("IMG"):
+                continue  # only IMG*.pdf
 
-            # 2) Ignore trashed
-            if fobj.get("trashed"):
-                continue
-
-            # 3) Only PDFs
-            if fobj.get("mimeType") != PDF_MT:
-                continue
-
-            name = fobj.get("name", "")
-
-            # 4) Already final-looking? (numbered or UNKNOWN_*): mark once and ignore
+            # Already final-looking? mark once & skip
             if RENAMED_RE.match(name or "") or UNKNOWN_RE.match(name or ""):
-                if (fobj.get("appProperties") or {}).get("lb_renamed") != "1":
-                    ensure_marked(d, fid)
+                if (f.get("appProperties") or {}).get("lb_renamed") != "1":
+                    ensure_marked(d, f["id"])
+                log_skip(name, "final-looking")
                 continue
 
-            # Don't reprocess items we've done
-            if (fobj.get("appProperties") or {}).get("lb_renamed") == "1":
+            # don't reprocess marked items
+            if (f.get("appProperties") or {}).get("lb_renamed") == "1":
                 continue
 
-            # 5) Permission check
-            if (fobj.get("capabilities") or {}).get("canRename") is False:
-                log_skip(name, "no rename permission")
-                continue
-
-            # Ensure we have parents + createdTime
-            parents = fobj.get("parents")
-            created = fobj.get("createdTime") or fobj.get("modifiedTime")
-            if not parents or not created:
-                meta = file_meta(d, fid)
-                if meta.get("trashed"):
-                    continue
-                parents = parents or (meta.get("parents") or [])
-                created = created or (meta.get("createdTime") or meta.get("modifiedTime"))
-                name = name or meta.get("name", "")
-
-            # 6) *** NEW uploads only ***
-            created_dt = iso_to_dt(created)
-            age = (now - created_dt).total_seconds()
-            if age > NEW_WINDOW_SECONDS:
-                log_skip(name, f"older than NEW_WINDOW_SECONDS ({int(age)}s)")
-                continue
-            if age < GRACE_SECONDS:
-                log_skip(name, f"too new ({int(age)}s < {GRACE_SECONDS}s)")
-                continue
-
-            # Must live under our root
+            # Must live under our configured root
+            parents = f.get("parents") or []
             if not is_under_root(d, parents, root_id, parent_cache):
                 continue
 
+            # Permission check
+            caps = f.get("capabilities") or {}
+            if caps.get("canRename") is False:
+                log_skip(name, "no rename permission")
+                continue
+
             # OCR first page
-            img = download_first_page(d, fid)
+            img = download_first_page(d, f["id"])
             if img is None:
                 log_skip(name, "no image")
                 continue
@@ -295,31 +261,28 @@ def main():
                 text, conf = ocr_with_confidence(preprocess_image(img))
 
             inv = extract_invoice_number(text) or "UNKNOWN"
-            if inv == "UNKNOWN" and UNKNOWN_RE.match(name or ""):
-                ensure_marked(d, fid)
-                continue
 
             parent_id = parents[0] if parents else root_id
             new_name = unique_name_in_folder(d, parent_id, f"{inv}.pdf")
             if new_name == name:
-                ensure_marked(d, fid)
+                ensure_marked(d, f["id"])
+                log_skip(name, "already correct")
                 continue
 
-            if safe_rename(d, fid, new_name):
+            if safe_rename(d, f["id"], new_name):
                 processed += 1
                 log.info("RENAMED %s -> %s", name, new_name)
+            else:
+                log.warning("FAILED RENAME %s -> %s", name, new_name)
 
-            if MAX_FILES_PER_RUN and processed >= MAX_FILES_PER_RUN:
-                break
-
-        token = resp.get("nextPageToken")
-        if not token or (MAX_FILES_PER_RUN and processed >= MAX_FILES_PER_RUN):
-            next_token = resp.get("newStartPageToken") or token
+        if processed >= MAX_FILES_PER_RUN:
             break
 
-    if next_token:
-        save_token(next_token)
-    log.info("Processed %d file(s).", processed)
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+
+    log.info("Processed %d file(s) this run.", processed)
 
 if __name__ == "__main__":
     main()
