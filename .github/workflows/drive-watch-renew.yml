@@ -2,7 +2,7 @@ name: Drive Watch Renew
 
 on:
   schedule:
-    - cron: "0 2 * * *"      # daily at 02:00 UTC
+    - cron: "0 2 * * *"   # daily
   workflow_dispatch: {}
 
 permissions:
@@ -11,15 +11,16 @@ permissions:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/luqmaan-belim/invoice-renamer:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-api-python-client google-auth google-auth-httplib2
       - name: Register Drive watch channel
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
@@ -32,30 +33,25 @@ jobs:
           from google.oauth2 import service_account
 
           SA = json.loads(os.environ["GDRIVE_SA_JSON"])
-          FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"].strip()
+          FOLDER = os.environ["GDRIVE_FOLDER_ID"].strip()
           HOOK = os.environ["WEBHOOK_URL"].strip()
-
-          SCOPES = ["https://www.googleapis.com/auth/drive"]
-          creds = service_account.Credentials.from_service_account_info(SA, scopes=SCOPES)
+          creds = service_account.Credentials.from_service_account_info(SA, scopes=["https://www.googleapis.com/auth/drive"])
           d = build("drive","v3",credentials=creds,cache_discovery=False)
 
-          # Resolve if the provided folder id is a shortcut and detect Shared Drive
-          meta = d.files().get(fileId=FOLDER_ID, fields="id,mimeType,driveId,shortcutDetails", supportsAllDrives=True).execute()
+          meta = d.files().get(fileId=FOLDER, fields="id,name,mimeType,driveId,shortcutDetails", supportsAllDrives=True).execute()
           if meta.get("mimeType") == "application/vnd.google-apps.shortcut":
             tgt = meta["shortcutDetails"]["targetId"]
-            meta = d.files().get(fileId=tgt, fields="id,mimeType,driveId", supportsAllDrives=True).execute()
-
+            meta = d.files().get(fileId=tgt, fields="id,name,mimeType,driveId", supportsAllDrives=True).execute()
           drive_id = meta.get("driveId")
 
-          # Get start token for My Drive or for the specific Shared Drive
           if drive_id:
             tok = d.changes().getStartPageToken(driveId=drive_id, supportsAllDrives=True).execute()["startPageToken"]
             body = {"id": str(uuid.uuid4()), "type": "web_hook", "address": HOOK}
-            d.changes().watch(pageToken=tok, body=body, driveId=drive_id, supportsAllDrives=True).execute()
+            resp = d.changes().watch(pageToken=tok, body=body, driveId=drive_id, supportsAllDrives=True).execute()
           else:
             tok = d.changes().getStartPageToken().execute()["startPageToken"]
             body = {"id": str(uuid.uuid4()), "type": "web_hook", "address": HOOK}
-            d.changes().watch(pageToken=tok, body=body).execute()
+            resp = d.changes().watch(pageToken=tok, body=body).execute()
 
-          print("Watch registered/renewed for Drive changes.")
+          print("Watch created:", resp)
           PY
