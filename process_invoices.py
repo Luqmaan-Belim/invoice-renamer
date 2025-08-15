@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """
-Invoice Renamer — Drive Changes API + PyMuPDF, ONE new file per run
+Invoice Renamer — Drive Changes API (NEW uploads only)
 
-• Only acts on PDFs created within NEW_WINDOW_SECONDS (default 15 min)
-• Renames at most ONE file per run (MAX_FILES_PER_RUN=1)
-• Verifies rename and stamps appProperties.lb_renamed=1
-• Skips anything already final (2025_123456.pdf or UNKNOWN_7.pdf)
+• Skips deletions/trashed.
+• Only processes PDFs whose createdTime is within NEW_WINDOW_SECONDS (default 15 min)
+  and older than GRACE_SECONDS (default 90s) -> i.e., truly NEW uploads.
+• Renames at most ONE file per run (MAX_FILES_PER_RUN=1 by default).
+• Verifies rename and stamps appProperties.lb_renamed=1 so we never re-touch it.
+• Ignores files already final-looking (2025_123456.pdf or UNKNOWN_7.pdf).
+
+Env (GitHub Actions → env/secrets):
+  GDRIVE_SA_JSON, GDRIVE_FOLDER_ID  (required)
+  NEW_WINDOW_SECONDS (default 900)
+  GRACE_SECONDS      (default 90)
+  MAX_FILES_PER_RUN  (default 1)
+  DEBUG_LIST         ("1" for verbose)
 """
 
 import os, io, re, json, time, logging, pathlib
@@ -45,7 +54,7 @@ def iso_to_dt(s: str) -> datetime:
 
 def log_skip(name: str, reason: str):
     if DEBUG:
-        log.info("SKIP %-24s %s", name or "(no-name)", reason)
+        log.info("SKIP %-24s %s", (name or "(no-name)"), reason)
 
 def drive():
     creds = service_account.Credentials.from_service_account_info(
@@ -148,7 +157,7 @@ def ensure_marked(d, fid):
                      supportsAllDrives=True).execute()
 
 def safe_rename(d, fid: str, target_name: str) -> bool:
-    for attempt in range(1, 4):
+    for _ in range(3):
         d.files().update(fileId=fid,
                          body={"name": target_name, "appProperties": {"lb_renamed": "1"}},
                          supportsAllDrives=True).execute()
@@ -216,30 +225,41 @@ def main():
         resp = d.changes().list(**kwargs).execute()
 
         for ch in resp.get("changes", []):
+            # 1) NEVER act on deletions
             if ch.get("removed", False):
                 continue
+
             fobj = ch.get("file") or {}
             fid = ch.get("fileId")
-            if not fid or not fobj:  # corrupted event
+            if not fid or not fobj:
                 continue
 
-            if fobj.get("trashed") or fobj.get("mimeType") != PDF_MT:
+            # 2) Ignore trashed
+            if fobj.get("trashed"):
+                continue
+
+            # 3) Only PDFs
+            if fobj.get("mimeType") != PDF_MT:
                 continue
 
             name = fobj.get("name", "")
-            # already final? mark & skip
+
+            # 4) Already final-looking? (numbered or UNKNOWN_*): mark once and ignore
             if RENAMED_RE.match(name or "") or UNKNOWN_RE.match(name or ""):
                 if (fobj.get("appProperties") or {}).get("lb_renamed") != "1":
                     ensure_marked(d, fid)
                 continue
 
+            # Don't reprocess items we've done
             if (fobj.get("appProperties") or {}).get("lb_renamed") == "1":
                 continue
 
+            # 5) Permission check
             if (fobj.get("capabilities") or {}).get("canRename") is False:
                 log_skip(name, "no rename permission")
                 continue
 
+            # Ensure we have parents + createdTime
             parents = fobj.get("parents")
             created = fobj.get("createdTime") or fobj.get("modifiedTime")
             if not parents or not created:
@@ -250,20 +270,24 @@ def main():
                 created = created or (meta.get("createdTime") or meta.get("modifiedTime"))
                 name = name or meta.get("name", "")
 
+            # 6) *** NEW uploads only ***
             created_dt = iso_to_dt(created)
             age = (now - created_dt).total_seconds()
-
-            # new-file only window
             if age > NEW_WINDOW_SECONDS:
+                log_skip(name, f"older than NEW_WINDOW_SECONDS ({int(age)}s)")
                 continue
             if age < GRACE_SECONDS:
+                log_skip(name, f"too new ({int(age)}s < {GRACE_SECONDS}s)")
                 continue
 
+            # Must live under our root
             if not is_under_root(d, parents, root_id, parent_cache):
                 continue
 
+            # OCR first page
             img = download_first_page(d, fid)
             if img is None:
+                log_skip(name, "no image")
                 continue
 
             text, conf = ocr_with_confidence(img)
@@ -285,11 +309,11 @@ def main():
                 processed += 1
                 log.info("RENAMED %s -> %s", name, new_name)
 
-            if processed >= MAX_FILES_PER_RUN:
+            if MAX_FILES_PER_RUN and processed >= MAX_FILES_PER_RUN:
                 break
 
         token = resp.get("nextPageToken")
-        if not token or processed >= MAX_FILES_PER_RUN:
+        if not token or (MAX_FILES_PER_RUN and processed >= MAX_FILES_PER_RUN):
             next_token = resp.get("newStartPageToken") or token
             break
 
