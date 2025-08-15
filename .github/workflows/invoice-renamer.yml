@@ -1,15 +1,22 @@
 name: Invoice Renamer (Changes API)
 
 on:
-  # Instant trigger from your Cloudflare Worker
+  # Instant trigger from Cloudflare Worker
   repository_dispatch:
     types: [drive_change]
-  # Optional manual runs
-  workflow_dispatch:
+
+  # Optional fallback (remove if not wanted)
+  schedule:
+    - cron: "*/30 * * * *"
+
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
 
 concurrency:
-  # All runs queue behind this key; no overlap, no deadlocks
-  group: invoice-renamer
+  # Queue runs; never cancel the one already running
+  group: invoice-renamer-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -21,17 +28,16 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Persist the Drive change token across runs
       - name: Restore Drive change token
         id: token
         uses: actions/cache/restore@v4
         with:
           path: .drive_change_token
-          key: drive-token-v5-
+          key: drive-token-v6-
           restore-keys: |
-            drive-token-v5-
+            drive-token-v6-
 
-      - name: Install system deps
+      - name: Install system packages
         run: |
           sudo apt-get update
           sudo apt-get install -y tesseract-ocr libgl1
@@ -47,16 +53,16 @@ jobs:
           pip install google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
           pip install pytesseract pymupdf opencv-python-headless numpy Pillow
 
-      - name: Process exactly ONE new invoice
+      - name: Process invoices (new-file only; one file max)
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
 
-          # --- behavior flags ---
-          DEBUG_LIST: "1"                  # set to "0" once happy with logs
-          GRACE_SECONDS: "60"              # wait after upload before touching
-          ONE_PER_RUN: "1"                 # <— process at most ONE file
-          ADDITIONS_WINDOW_SECONDS: "900"  # treat as "addition" if created ≤ 15m ago
+          # Behavior knobs
+          DEBUG_LIST: "0"             # set "1" temporarily if you want verbose logs
+          GRACE_SECONDS: "90"         # uploader settle time
+          NEW_WINDOW_SECONDS: "900"   # treat files created in last 15min as "new"
+          MAX_FILES_PER_RUN: "1"      # at most ONE file per run
         run: python process_invoices.py
 
       - name: Save Drive change token
@@ -64,4 +70,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .drive_change_token
-          key: drive-token-v5-${{ github.run_id }}
+          key: drive-token-v6-${{ github.run_id }}
