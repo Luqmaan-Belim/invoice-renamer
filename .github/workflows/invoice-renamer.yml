@@ -42,17 +42,16 @@ jobs:
           restore-keys: |
             drive-token-v7-
 
-      - name: Process invoices (new-file only; one file max)
+      - name: Process invoices (new-file only; batch)
         env:
-          # Required
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
 
-          # Behaviour knobs
-          GRACE_SECONDS: "90"         # let uploads finish
-          NEW_WINDOW_SECONDS: "900"   # treat only last 15min as "new"
-          MAX_FILES_PER_RUN: "1"      # rename at most one file per run
-          DEBUG_LIST: "0"             # set "1" for verbose logs
+          # Behavior knobs
+          GRACE_SECONDS: "60"          # allow uploads to finish
+          NEW_WINDOW_SECONDS: "1800"   # treat last 30 min as "new"
+          MAX_FILES_PER_RUN: "80"      # <-- process up to 80 new PDFs in one run
+          DEBUG_LIST: "0"
         run: python3 /app/process_invoices.py
 
       - name: Save Drive change token
