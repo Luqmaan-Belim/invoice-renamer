@@ -4,7 +4,7 @@ on:
   repository_dispatch:
     types: [drive_change]
   schedule:
-    - cron: "0,30 * * * *"   # optional periodic sweep
+    - cron: "0,30 * * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
-    # Use your prebuilt image — NOTE: must be all lowercase
+    # Use your prebuilt runtime image (Python + Tesseract etc.)
     container:
       image: ghcr.io/luqmaan-belim/invoice-renamer:latest
 
@@ -31,6 +31,6 @@ jobs:
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          MAX_FILES_PER_RUN: "120"   # adjust as needed
-          DEBUG_LIST: "0"
-        run: python /app/process_invoices.py
+          MAX_FILES_PER_RUN: "120"
+          DEBUG_LIST: "1"       # turn on for one run to see why files are skipped
+        run: python process_invoices.py   # <-- IMPORTANT: run the repo copy, not /app
