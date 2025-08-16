@@ -3,33 +3,75 @@ name: drive_change
 on:
   repository_dispatch:
     types: [drive_change]
-  schedule:
-    - cron: "0,30 * * * *"
   workflow_dispatch: {}
 
-permissions:
-  contents: read
-  packages: read
-
+# ensure only one run; newer dispatch cancels older in-flight runs
 concurrency:
-  group: invoice-renamer-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  group: invoice-renamer-drive-change
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    container:
-      image: ghcr.io/luqmaan-belim/invoice-renamer:latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Process IMG*.pdf files (batch rename)
+      # --- Restore the last startPageToken so we only process NEW changes
+      - name: Restore Drive change token
+        id: token-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .drive_change_token
+          # we save with a unique key each run; restore picks the most recent by prefix
+          key: drive-token-
+          restore-keys: |
+            drive-token-
+
+      # (optional) show whether we actually restored a token
+      - name: Show restored token (optional)
+        run: |
+          if [[ -f .drive_change_token ]]; then
+            echo "Restored token file:"
+            cat .drive_change_token
+          else
+            echo "No token restored; first run will initialize a token."
+          fi
+
+      # --- System deps (tesseract for pytesseract)
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
+
+      # --- Python deps
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python requirements
+        run: |
+          pip install --upgrade pip
+          pip install google-api-python-client google-auth \
+                      PyMuPDF pillow numpy opencv-python-headless pytesseract
+
+      # --- Run the changes-only processor
+      - name: Process IMG*.pdf files (changes-only)
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          MAX_FILES_PER_RUN: "120"
-          DEBUG_LIST: "1"
-        run: python process_invoices.py
+          DEBUG_LIST: ${{ vars.DEBUG_LIST }}
+        run: |
+          python process_invoices.py
+
+      # --- Save updated token so next run uses deltas, not init
+      - name: Save Drive change token
+        # always try to save (even if the job was canceled)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .drive_change_token
+          # unique key so it can be updated; restore uses the 'drive-token-' prefix
+          key: drive-token-${{ github.run_id }}
