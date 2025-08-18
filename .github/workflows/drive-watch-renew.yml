@@ -7,7 +7,6 @@ permissions: { contents: read }
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
     steps:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
@@ -19,10 +18,11 @@ jobs:
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}  # set to https://gdrive-hook.accounts-880.workers.dev/hook
         run: |
           python - <<'PY'
-          import os, json, uuid, datetime
+          import os, json, uuid, datetime, time
+          from urllib.parse import urlsplit
           from googleapiclient.discovery import build
           from google.oauth2 import service_account
 
@@ -30,25 +30,24 @@ jobs:
           FOLDER = os.environ["GDRIVE_FOLDER_ID"].strip()
           HOOK = os.environ["WEBHOOK_URL"].strip()
           if not HOOK.endswith("/hook"): HOOK = HOOK.rstrip("/") + "/hook"
-          print("REGISTERING HOOK ADDRESS:", HOOK)
+          parts = urlsplit(HOOK)
+          print("REGISTER HOST:", parts.hostname, "PATH:", parts.path)
 
+          HOOK = HOOK + ("?t=" + str(int(time.time())))  # force a fresh address
           creds = service_account.Credentials.from_service_account_info(
               SA, scopes=["https://www.googleapis.com/auth/drive"]
           )
-          d = build("drive","v3",credentials=creds,cache_discovery=False)
-
+          d = build("drive", "v3", credentials=creds, cache_discovery=False)
           meta = d.files().get(fileId=FOLDER, fields="id,mimeType,shortcutDetails,driveId",
                                supportsAllDrives=True).execute()
           if meta.get("mimeType") == "application/vnd.google-apps.shortcut":
-              tgt = meta["shortcutDetails"]["targetId"]
-              meta = d.files().get(fileId=tgt, fields="id,driveId", supportsAllDrives=True).execute()
-
+              meta = d.files().get(fileId=meta["shortcutDetails"]["targetId"],
+                                   fields="id,driveId", supportsAllDrives=True).execute()
           drive_id = meta.get("driveId")
           start = d.changes().getStartPageToken(
-              **({"driveId":drive_id,"supportsAllDrives":True} if drive_id else {})
+              **({"driveId": drive_id, "supportsAllDrives": True} if drive_id else {})
           ).execute()["startPageToken"]
-
-          body = {"id": str(uuid.uuid4()), "type":"web_hook", "address": HOOK}
+          body = {"id": str(uuid.uuid4()), "type": "web_hook", "address": HOOK}
           if drive_id:
               resp = d.changes().watch(pageToken=start, body=body,
                                        driveId=drive_id, supportsAllDrives=True,
@@ -59,6 +58,6 @@ jobs:
 
           exp_ms = resp.get("expiration")
           exp_iso = datetime.datetime.utcfromtimestamp(int(exp_ms)/1000).isoformat()+"Z" if exp_ms else "unknown"
-          print("Watch created: id:", resp.get("id"), "resourceId:", resp.get("resourceId"))
-          print("Expiration:", exp_iso)
+          print("Watch id:", resp.get("id"), "resourceId:", resp.get("resourceId"))
+          print("Expires:", exp_iso)
           PY
