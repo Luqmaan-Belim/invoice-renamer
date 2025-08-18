@@ -1,89 +1,64 @@
+# .github/workflows/drive-watch-renew.yml
 name: Drive Watch Renew
-
 on:
-  schedule:
-    - cron: "0 */6 * * *"   # renew every 6 hours (safer than daily)
+  schedule: [{ cron: "0 2 * * *" }]
   workflow_dispatch: {}
-
-permissions:
-  contents: read
-
+permissions: { contents: read }
 jobs:
   renew:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
+        with: { python-version: "3.11" }
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install google-api-python-client google-auth google-auth-httplib2
-
       - name: Register Drive watch channel
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}   # e.g. https://gdrive-hook.accounts-880.workers.dev
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: |
           python - <<'PY'
           import os, json, uuid, datetime
           from googleapiclient.discovery import build
           from google.oauth2 import service_account
 
-          SA      = json.loads(os.environ["GDRIVE_SA_JSON"])
-          FOLDER  = os.environ["GDRIVE_FOLDER_ID"].strip()
-          HOOK_IN = os.environ["WEBHOOK_URL"].strip()
-          HOOK    = HOOK_IN if HOOK_IN.endswith("/hook") else HOOK_IN.rstrip("/") + "/hook"
+          SA = json.loads(os.environ["GDRIVE_SA_JSON"])
+          FOLDER = os.environ["GDRIVE_FOLDER_ID"].strip()
+          HOOK = os.environ["WEBHOOK_URL"].strip()
+          if not HOOK.endswith("/hook"): HOOK = HOOK.rstrip("/") + "/hook"
+          print("REGISTERING HOOK ADDRESS:", HOOK)
 
           creds = service_account.Credentials.from_service_account_info(
               SA, scopes=["https://www.googleapis.com/auth/drive"]
           )
-          d = build("drive", "v3", credentials=creds, cache_discovery=False)
+          d = build("drive","v3",credentials=creds,cache_discovery=False)
 
-          def files_get(fid, fields):
-            return d.files().get(fileId=fid, fields=fields, supportsAllDrives=True).execute()
-
-          # Resolve shortcuts -> real folder, and capture driveId if on a Shared Drive
-          meta = files_get(FOLDER, "id,name,mimeType,driveId,shortcutDetails")
+          meta = d.files().get(fileId=FOLDER, fields="id,mimeType,shortcutDetails,driveId",
+                               supportsAllDrives=True).execute()
           if meta.get("mimeType") == "application/vnd.google-apps.shortcut":
-            tgt = meta["shortcutDetails"]["targetId"]
-            meta = files_get(tgt, "id,name,mimeType,driveId")
+              tgt = meta["shortcutDetails"]["targetId"]
+              meta = d.files().get(fileId=tgt, fields="id,driveId", supportsAllDrives=True).execute()
 
           drive_id = meta.get("driveId")
+          start = d.changes().getStartPageToken(
+              **({"driveId":drive_id,"supportsAllDrives":True} if drive_id else {})
+          ).execute()["startPageToken"]
 
-          # Get a fresh startPageToken and create the watch
-          body = {"id": str(uuid.uuid4()), "type": "web_hook", "address": HOOK}
-
+          body = {"id": str(uuid.uuid4()), "type":"web_hook", "address": HOOK}
           if drive_id:
-            token = d.changes().getStartPageToken(
-              driveId=drive_id, supportsAllDrives=True
-            ).execute()["startPageToken"]
-
-            resp = d.changes().watch(
-              pageToken=token, body=body, driveId=drive_id,
-              supportsAllDrives=True, includeItemsFromAllDrives=True
-            ).execute()
+              resp = d.changes().watch(pageToken=start, body=body,
+                                       driveId=drive_id, supportsAllDrives=True,
+                                       includeItemsFromAllDrives=True).execute()
           else:
-            token = d.changes().getStartPageToken().execute()["startPageToken"]
+              resp = d.changes().watch(pageToken=start, body=body,
+                                       supportsAllDrives=True).execute()
 
-            resp = d.changes().watch(
-              pageToken=token, body=body,
-              supportsAllDrives=True, includeItemsFromAllDrives=True
-            ).execute()
-
-          # Pretty-print key details
           exp_ms = resp.get("expiration")
-          if exp_ms:
-            exp_iso = datetime.datetime.utcfromtimestamp(int(exp_ms)/1000).isoformat()+"Z"
-          else:
-            exp_iso = "unknown"
-
-          print("Watch created/renewed:")
-          print("  address     :", resp.get("address"))
-          print("  channelId   :", resp.get("id"))
-          print("  resourceId  :", resp.get("resourceId"))
-          print("  expiration  :", exp_iso)
+          exp_iso = datetime.datetime.utcfromtimestamp(int(exp_ms)/1000).isoformat()+"Z" if exp_ms else "unknown"
+          print("Watch created: id:", resp.get("id"), "resourceId:", resp.get("resourceId"))
+          print("Expiration:", exp_iso)
           PY
