@@ -1,7 +1,7 @@
 # .github/workflows/drive-watch-renew.yml
 name: Drive Watch Renew
 on:
-  schedule: [{ cron: "0 2 * * *" }]
+  schedule: [{ cron: "*/60 * * * *" }]
   workflow_dispatch: {}
 permissions: { contents: read }
 jobs:
