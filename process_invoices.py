@@ -35,6 +35,7 @@ import pytesseract
 import fitz  # PyMuPDF
 
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 from google.oauth2 import service_account
 
 # ---------- Logging ----------
@@ -49,8 +50,11 @@ FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"].strip()
 SA_JSON = json.loads(os.environ["GDRIVE_SA_JSON"])
 DEBUG = os.environ.get("DEBUG_LIST", "0") == "1"
 
-# Where we persist the Drive startPageToken between runs (Actions cache keeps this file)
+# Where we persist the Drive startPageToken between runs.
+# The authoritative copy lives in Drive appDataFolder; we mirror it locally for compatibility.
 TOKEN_PATH = pathlib.Path(".drive_change_token")
+TOKEN_APPDATA_NAME = "invoice-renamer-token"
+DISABLE_APPDATA_TOKEN = os.environ.get("DISABLE_APPDATA_TOKEN", "0") == "1"
 
 # MIME constants
 PDF_MT = "application/pdf"
@@ -102,16 +106,71 @@ def get_start_token(d, drive_id: Optional[str]) -> str:
     return resp["startPageToken"]
 
 
-def load_token() -> Optional[str]:
+def load_token(d) -> Optional[str]:
+    token: Optional[str] = None
+
+    if not DISABLE_APPDATA_TOKEN:
+        try:
+            resp = d.files().list(
+                spaces="appDataFolder",
+                q=f"name='{TOKEN_APPDATA_NAME}' and trashed=false",
+                fields="files(id)",
+                pageSize=1,
+            ).execute()
+            files = resp.get("files") or []
+            if files:
+                data = d.files().get_media(fileId=files[0]["id"]).execute()
+                if isinstance(data, bytes):
+                    token = data.decode("utf-8", errors="ignore").strip()
+                else:
+                    token = str(data).strip()
+        except Exception as exc:
+            log.warning("Unable to read Drive token from appData: %s", exc)
+
+    if token:
+        try:
+            TOKEN_PATH.write_text(token)
+        except Exception:
+            pass
+        return token or None
+
     try:
         token = TOKEN_PATH.read_text().strip()
-        return token or None
+        if not token:
+            return None
+        if not DISABLE_APPDATA_TOKEN:
+            log.info("Using local Drive change token fallback; enable DISABLE_APPDATA_TOKEN=1 to opt out of appData usage if desired.")
+        return token
     except FileNotFoundError:
         return None
 
 
-def save_token(token: str):
-    TOKEN_PATH.write_text(token)
+def save_token(d, token: str):
+    try:
+        TOKEN_PATH.write_text(token)
+    except Exception:
+        pass
+
+    if DISABLE_APPDATA_TOKEN:
+        return
+
+    data = token.encode("utf-8")
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="text/plain")
+    try:
+        resp = d.files().list(
+            spaces="appDataFolder",
+            q=f"name='{TOKEN_APPDATA_NAME}' and trashed=false",
+            fields="files(id)",
+            pageSize=1,
+        ).execute()
+        files = resp.get("files") or []
+        if files:
+            d.files().update(fileId=files[0]["id"], media_body=media).execute()
+        else:
+            body = {"name": TOKEN_APPDATA_NAME, "parents": ["appDataFolder"]}
+            d.files().create(body=body, media_body=media, fields="id").execute()
+    except Exception as exc:
+        log.warning("Unable to save Drive token to appData: %s", exc)
 
 
 def file_meta(d, fid: str, fields: str):
@@ -242,10 +301,10 @@ def main():
     d = drive()
     root_id, drive_id = resolve_root(d, FOLDER_ID)
 
-    token = load_token()
+    token = load_token(d)
     if not token:
         token = get_start_token(d, drive_id)
-        save_token(token)
+        save_token(d, token)
         log.info("Initialized change token; next run will process deltas.")
         return
 
@@ -332,7 +391,7 @@ def main():
             break
 
     if next_token:
-        save_token(next_token)
+        save_token(d, next_token)
 
     log.info("Processed %d file(s) this run.", processed)
 
