@@ -5,7 +5,7 @@ on:
     types: [drive_change]
   workflow_dispatch: {}
 
-# ensure only one run; newer dispatch cancels older in-flight runs
+# Ensure only one run does work at a time; new dispatches wait for earlier runs.
 concurrency:
   group: invoice-renamer-drive-change
   cancel-in-progress: false
@@ -17,6 +17,32 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Wait for earlier drive_change runs to finish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_FILE: invoice-renamer.yml
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          echo "Checking for earlier workflow runs before continuing..."
+          attempts=0
+          while true; do
+            older=$(gh api repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs \
+              -F per_page=100 \
+              --jq '.workflow_runs[] | select((.status=="in_progress" or .status=="queued" or .status=="waiting") and .run_number < ($env.RUN_NUMBER|tonumber)) | .id' \
+              | head -n1)
+            if [ -z "$older" ]; then
+              echo "No earlier runs are active; continuing."
+              break
+            fi
+            attempts=$((attempts + 1))
+            if [ "$attempts" -ge 40 ]; then
+              echo "Timed out waiting for earlier runs after $attempts checks." >&2
+              exit 1
+            fi
+            echo "Earlier run $older still active. Waiting 30s before rechecking..."
+            sleep 30
+          done
 
       # --- Restore the last startPageToken so we only process NEW changes
       - name: Restore Drive change token
