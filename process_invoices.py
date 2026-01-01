@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 """
-Invoice Renamer — Changes-only (fast) version.
+Invoice Renamer — Changes-only (fast) version + Odoo attachment (customer invoices).
 
+What it does:
 - Uses Drive Changes API with a persisted startPageToken: only processes NEW/CHANGED files.
 - Resolves the provided folder ID if it’s a shortcut, supports My Drive & Shared Drives.
 - Filters to PDFs whose names start with "IMG" (case-insensitive), within the folder tree.
 - OCRs the first page with Tesseract (rasterized via PyMuPDF) and renames the file in place.
 - Skips items already in final "NNNN[_mmmmmm][_n].pdf" form.
+- OPTIONAL: attaches the PDF to the matching Odoo customer invoice (account.move out_invoice)
+  by converting "2026_000073" -> "INV/2026/000073".
 
 ENV
-  GDRIVE_SA_JSON   : service account JSON (one line)
-  GDRIVE_FOLDER_ID : target folder ID (not shortcut; will be resolved if it is)
-  DEBUG_LIST       : "1" for verbose logging (optional)
+  GDRIVE_SA_JSON        : service account JSON (one line)
+  GDRIVE_FOLDER_ID      : target folder ID (not shortcut; will be resolved if it is)
+  DEBUG_LIST            : "1" for verbose logging (optional)
+
+  ENABLE_ODOO           : "1" to enable Odoo attachment (optional)
+  ODOO_URL              : e.g. https://yourcompany.odoo.com
+  ODOO_DB               : database name
+  ODOO_USER             : login/email
+  ODOO_API_KEY          : API key for the user
+
+  DISABLE_APPDATA_TOKEN : "1" to not use Drive appDataFolder for token persistence (optional)
 
 Python requirements
   google-api-python-client, google-auth
@@ -19,9 +30,12 @@ Python requirements
 
 System requirement
   tesseract-ocr
+
+Notes:
+- Odoo integration assumes invoices are POSTED and the invoice number is in account.move.name
+  like "INV/2026/000073". Draft invoices usually have name="/" and won’t match.
 """
 
-import base64
 import io
 import os
 import re
@@ -39,6 +53,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from google.oauth2 import service_account
 
+
 # ---------- Logging ----------
 logging.basicConfig(
     level=logging.INFO,
@@ -46,10 +61,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("invoice_renamer")
 
+
 # ---------- Config from env ----------
 FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"].strip()
 SA_JSON = json.loads(os.environ["GDRIVE_SA_JSON"])
 DEBUG = os.environ.get("DEBUG_LIST", "0") == "1"
+
+ENABLE_ODOO = os.environ.get("ENABLE_ODOO", "0") == "1"
 
 # Where we persist the Drive startPageToken between runs.
 # The authoritative copy lives in Drive appDataFolder; we mirror it locally for compatibility.
@@ -65,6 +83,7 @@ SHORTCUT_MT = "application/vnd.google-apps.shortcut"
 # File name filters/patterns
 IMG_PDF_RE = re.compile(r"^IMG.*\.pdf$", re.I)
 RENAMED_RE = re.compile(r"^\d{4}(?:_\d{1,6})?(?:_\d+)?\.pdf$", re.I)
+
 
 # ---------- Drive helpers ----------
 def drive():
@@ -140,7 +159,9 @@ def load_token(d) -> Optional[str]:
         if not token:
             return None
         if not DISABLE_APPDATA_TOKEN:
-            log.info("Using local Drive change token fallback; enable DISABLE_APPDATA_TOKEN=1 to opt out of appData usage if desired.")
+            log.info(
+                "Using local Drive change token fallback; set DISABLE_APPDATA_TOKEN=1 to opt out of appData usage."
+            )
         return token
     except FileNotFoundError:
         return None
@@ -199,7 +220,11 @@ def is_under_root(
             parents = parent_cache[pid]
         else:
             try:
-                md = d.files().get(fileId=pid, fields="id,parents", supportsAllDrives=True).execute()
+                md = d.files().get(
+                    fileId=pid,
+                    fields="id,parents",
+                    supportsAllDrives=True
+                ).execute()
                 parents = md.get("parents") or []
             except Exception:
                 parents = []
@@ -210,26 +235,22 @@ def is_under_root(
 
 
 # ---------- Download & OCR ----------
-def download_first_page(d, file_id: str) -> Optional[np.ndarray]:
-    """
-    Download the PDF and rasterize the first page ~300 DPI using PyMuPDF.
-    Returns an RGB uint8 HxWx3 array or None.
-    """
+def download_pdf_bytes(d, file_id: str) -> Optional[bytes]:
     req = d.files().get_media(fileId=file_id)
     buf = io.BytesIO()
-    downloader = next_chunk = None
     from googleapiclient.http import MediaIoBaseDownload
     downloader = MediaIoBaseDownload(buf, req)
     done = False
     while not done:
         _, done = downloader.next_chunk()
     data = buf.getvalue()
-    if not data:
-        return None
+    return data or None
 
+
+def rasterize_first_page(pdf_bytes: bytes) -> Optional[np.ndarray]:
     zoom = 300.0 / 72.0  # 72pt baseline -> ~300 DPI
     mat = fitz.Matrix(zoom, zoom)
-    with fitz.open(stream=data, filetype="pdf") as doc:
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
         if doc.page_count == 0:
             return None
         page = doc.load_page(0)
@@ -259,7 +280,7 @@ def preprocess_image(image: np.ndarray) -> np.ndarray:
 def extract_invoice_number(text: str) -> Optional[str]:
     """
     Extract invoice number. Pattern: (INV|NV) ... 4+digits ... up to 6 trailing digits.
-    Produces 'NNNN[_mmmmmm]' style after cleaning.
+    Produces 'NNNN[_mmmmmm]' style after cleaning (ex: 2026_000073).
     """
     m = re.search(r"(?:INV|NV)[^\d]*(\d{4}[^\d]*\d{1,6})", text, flags=re.I)
     if not m:
@@ -313,6 +334,19 @@ def main():
     processed = 0
     next_token = None
 
+    # Lazy-init Odoo client only if needed
+    odoo_client = None
+    to_odoo_invoice_name = None
+    if ENABLE_ODOO:
+        try:
+            from odoo_attach import OdooClient, to_odoo_invoice_name as _to_odoo_invoice_name
+            odoo_client = OdooClient()
+            to_odoo_invoice_name = _to_odoo_invoice_name
+            log.info("Odoo integration enabled.")
+        except Exception as e:
+            log.warning("Odoo integration requested but failed to init: %s", e)
+            odoo_client = None
+
     while True:
         kwargs = dict(
             pageToken=token,
@@ -363,11 +397,17 @@ def main():
                     log.info("SKIP %s  outside target tree", name)
                 continue
 
-            # Download first page & OCR
-            img = download_first_page(d, fid)
+            # Download PDF bytes once; OCR uses first page raster
+            pdf_bytes = download_pdf_bytes(d, fid)
+            if not pdf_bytes:
+                if DEBUG:
+                    log.info("No PDF bytes for %s; skipping", name)
+                continue
+
+            img = rasterize_first_page(pdf_bytes)
             if img is None:
                 if DEBUG:
-                    log.info("No image for %s; skipping", name)
+                    log.info("No raster image for %s; skipping", name)
                 continue
 
             text, conf = ocr_with_confidence(img)
@@ -379,10 +419,39 @@ def main():
 
             parent_id = parents[0] if parents else root_id
             new_name = unique_name_in_folder(d, parent_id, f"{inv}.pdf")
+
             if new_name != name:
                 rename_in_drive(d, fid, new_name)
                 log.info("RENAMED  %s -> %s", name, new_name)
                 processed += 1
+
+                # Optional: attach to Odoo customer invoice
+                if ENABLE_ODOO and odoo_client and inv != "UNKNOWN" and to_odoo_invoice_name:
+                    try:
+                        odoo_number = to_odoo_invoice_name(inv)  # 2026_000073 -> INV/2026/000073
+                        matches = odoo_client.search_customer_invoice_by_number(odoo_number)
+
+                        if len(matches) == 1:
+                            move_id = matches[0]
+                            attach_id = odoo_client.attach_pdf_to_move(move_id, new_name, pdf_bytes)
+                            log.info(
+                                "ODOO ATTACHED %s to invoice=%s move_id=%s attachment_id=%s",
+                                new_name, odoo_number, move_id, attach_id
+                            )
+                        elif len(matches) == 0:
+                            log.warning(
+                                "ODOO NO MATCH for invoice=%s (from scan=%s) file=%s",
+                                odoo_number, inv, new_name
+                            )
+                        else:
+                            log.warning(
+                                "ODOO MULTIPLE MATCHES for invoice=%s -> %s (file=%s)",
+                                odoo_number, matches, new_name
+                            )
+
+                    except Exception as e:
+                        log.warning("ODOO ATTACH FAILED for %s (inv=%s): %s", new_name, inv, e)
+
             elif DEBUG:
                 log.info("SKIP %s  name unchanged", name)
 
