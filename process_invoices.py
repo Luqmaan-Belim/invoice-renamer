@@ -21,6 +21,7 @@ System requirement
   tesseract-ocr
 """
 
+import base64
 import io
 import os
 import re
