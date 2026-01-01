@@ -63,6 +63,13 @@ jobs:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           DEBUG_LIST: ${{ vars.DEBUG_LIST }}
+
+          # ---- Odoo integration (NEW) ----
+          ENABLE_ODOO: "1"
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USER: ${{ secrets.ODOO_USER }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
         run: |
           python process_invoices.py
 
