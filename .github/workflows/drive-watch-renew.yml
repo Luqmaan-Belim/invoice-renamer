@@ -1,63 +1,47 @@
 # .github/workflows/drive-watch-renew.yml
 name: Drive Watch Renew
+
 on:
   schedule: [{ cron: "*/60 * * * *" }]
   workflow_dispatch: {}
+
 permissions: { contents: read }
+
 jobs:
   renew:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install google-api-python-client google-auth google-auth-httplib2
-      - name: Register Drive watch channel
+
+      # Restore the last watch channel info so we can STOP it before creating a new one.
+      - name: Restore Drive watch channel info
+        uses: actions/cache/restore@v4
+        with:
+          path: .drive_watch_channel.json
+          key: drive-watch-
+          restore-keys: |
+            drive-watch-
+
+      - name: Renew Drive watch channel (stop old, create new)
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}  # set to https://gdrive-hook.accounts-880.workers.dev/hook
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }} # should be stable; script forces /hook, no ?t=
         run: |
-          python - <<'PY'
-          import os, json, uuid, datetime, time
-          from urllib.parse import urlsplit
-          from googleapiclient.discovery import build
-          from google.oauth2 import service_account
+          python renew_watch.py
 
-          SA = json.loads(os.environ["GDRIVE_SA_JSON"])
-          FOLDER = os.environ["GDRIVE_FOLDER_ID"].strip()
-          HOOK = os.environ["WEBHOOK_URL"].strip()
-          if not HOOK.endswith("/hook"): HOOK = HOOK.rstrip("/") + "/hook"
-          parts = urlsplit(HOOK)
-          print("REGISTER HOST:", parts.hostname, "PATH:", parts.path)
-
-          HOOK = HOOK + ("?t=" + str(int(time.time())))  # force a fresh address
-          creds = service_account.Credentials.from_service_account_info(
-              SA, scopes=["https://www.googleapis.com/auth/drive"]
-          )
-          d = build("drive", "v3", credentials=creds, cache_discovery=False)
-          meta = d.files().get(fileId=FOLDER, fields="id,mimeType,shortcutDetails,driveId",
-                               supportsAllDrives=True).execute()
-          if meta.get("mimeType") == "application/vnd.google-apps.shortcut":
-              meta = d.files().get(fileId=meta["shortcutDetails"]["targetId"],
-                                   fields="id,driveId", supportsAllDrives=True).execute()
-          drive_id = meta.get("driveId")
-          start = d.changes().getStartPageToken(
-              **({"driveId": drive_id, "supportsAllDrives": True} if drive_id else {})
-          ).execute()["startPageToken"]
-          body = {"id": str(uuid.uuid4()), "type": "web_hook", "address": HOOK}
-          if drive_id:
-              resp = d.changes().watch(pageToken=start, body=body,
-                                       driveId=drive_id, supportsAllDrives=True,
-                                       includeItemsFromAllDrives=True).execute()
-          else:
-              resp = d.changes().watch(pageToken=start, body=body,
-                                       supportsAllDrives=True).execute()
-
-          exp_ms = resp.get("expiration")
-          exp_iso = datetime.datetime.utcfromtimestamp(int(exp_ms)/1000).isoformat()+"Z" if exp_ms else "unknown"
-          print("Watch id:", resp.get("id"), "resourceId:", resp.get("resourceId"))
-          print("Expires:", exp_iso)
-          PY
+      - name: Save Drive watch channel info
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .drive_watch_channel.json
+          key: drive-watch-${{ github.run_id }}
