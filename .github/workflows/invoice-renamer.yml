@@ -1,9 +1,7 @@
 name: drive_change
 
 on:
-  schedule:
-    # Run automatically every 10 minutes.
-    - cron: "*/10 * * * *"
+  schedule: [{ cron: "*/10 * * * *" }]
 
 # ensure only one scheduled run at a time
 concurrency:
