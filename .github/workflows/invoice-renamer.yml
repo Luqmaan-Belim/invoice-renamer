@@ -1,7 +1,9 @@
 name: drive_change
 
 on:
-  schedule: [{ cron: "*/10 * * * *" }]
+  schedule:
+    # Run every 10 minutes, offset from :00 to avoid GitHub's busiest cron minute.
+    - cron: "3,13,23,33,43,53 * * * *"
 
 # ensure only one scheduled run at a time
 concurrency:
