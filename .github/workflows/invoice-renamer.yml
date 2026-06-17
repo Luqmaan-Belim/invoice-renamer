@@ -1,6 +1,9 @@
 name: drive_change
 
 on:
+  schedule:
+    # Run automatically every 10 minutes in addition to Drive webhook dispatches.
+    - cron: "*/10 * * * *"
   repository_dispatch:
     types: [drive_change]
   workflow_dispatch: {}
