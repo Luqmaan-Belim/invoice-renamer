@@ -2,23 +2,13 @@
 name: Drive Watch Renew
 
 on:
-  schedule:
-    # Run Drive change processing every 10 minutes from this already-active scheduled workflow.
-    - cron: "3,13,23,33,43,53 * * * *"
-    # Renew the Drive watch channel hourly, offset from the Drive change processing minutes.
-    - cron: "7 * * * *"
+  schedule: [{ cron: "*/60 * * * *" }]
   workflow_dispatch: {}
 
 permissions: { contents: read }
 
 jobs:
-  process_drive_changes:
-    if: ${{ github.event_name == 'schedule' && github.event.schedule == '3,13,23,33,43,53 * * * *' }}
-    uses: ./.github/workflows/invoice-renamer.yml
-    secrets: inherit
-
   renew:
-    if: ${{ github.event_name != 'schedule' || github.event.schedule == '7 * * * *' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
