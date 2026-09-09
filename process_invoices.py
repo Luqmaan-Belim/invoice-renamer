@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Iterator, List, Optional, Tuple
 
@@ -136,7 +137,8 @@ def iter_outstanding_pdfs(d, root_id: str, drive_id: Optional[str]) -> Iterator[
                 "q": f"'{folder_id}' in parents and trashed=false",
                 "fields": (
                     "nextPageToken,files("
-                    "id,name,mimeType,parents,shortcutDetails(targetId,targetMimeType))"
+                    "id,name,mimeType,parents,size,modifiedTime,md5Checksum,"
+                    "shortcutDetails(targetId,targetMimeType))"
                 ),
                 "pageSize": 1000,
                 "supportsAllDrives": True,
@@ -163,15 +165,88 @@ def iter_outstanding_pdfs(d, root_id: str, drive_id: Optional[str]) -> Iterator[
                 break
 
 
-def download_pdf_bytes(d, file_id: str) -> Optional[bytes]:
+def _expected_size(file_object: dict) -> Optional[int]:
+    value = file_object.get("size")
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def download_pdf_bytes(d, file_object: dict, max_attempts: int = 3) -> Optional[bytes]:
+    """Download a Drive PDF robustly and distinguish true zero-byte scanner files."""
     from googleapiclient.http import MediaIoBaseDownload
-    request = d.files().get_media(fileId=file_id)
-    buffer = io.BytesIO()
-    downloader = MediaIoBaseDownload(buffer, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    return buffer.getvalue() or None
+
+    file_id = file_object["id"]
+    name = file_object.get("name", file_id)
+    expected_size = _expected_size(file_object)
+    modified_time = file_object.get("modifiedTime", "unknown")
+
+    # Scanner software can expose the file entry before its content has finished
+    # uploading. Do not burn time repeatedly downloading a file Drive says is empty;
+    # the next sweep will retry it after the scanner finishes writing it.
+    if expected_size == 0:
+        log.warning(
+            "RETRY LATER %s: Drive reports size=0 bytes (modified=%s)",
+            name, modified_time,
+        )
+        return None
+
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            request = d.files().get_media(
+                fileId=file_id,
+                supportsAllDrives=True,
+            )
+            buffer = io.BytesIO()
+            downloader = MediaIoBaseDownload(buffer, request, chunksize=1024 * 1024)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk(num_retries=2)
+            data = buffer.getvalue()
+
+            if data:
+                if expected_size is not None and len(data) != expected_size:
+                    log.warning(
+                        "DOWNLOAD SIZE MISMATCH %s attempt=%d/%d expected=%d got=%d",
+                        name, attempt, max_attempts, expected_size, len(data),
+                    )
+                else:
+                    if DEBUG:
+                        log.info(
+                            "DOWNLOADED %s bytes=%d attempt=%d/%d",
+                            name, len(data), attempt, max_attempts,
+                        )
+                    return data
+
+                # A partial response is not safe to OCR. Retry with a fresh request.
+                if attempt < max_attempts:
+                    time.sleep(attempt)
+                    continue
+                return None
+
+            log.warning(
+                "EMPTY DRIVE DOWNLOAD %s attempt=%d/%d Drive-size=%s modified=%s",
+                name, attempt, max_attempts,
+                expected_size if expected_size is not None else "unknown",
+                modified_time,
+            )
+        except Exception as exc:
+            last_error = exc
+            log.warning(
+                "DRIVE DOWNLOAD FAILED %s attempt=%d/%d: %s",
+                name, attempt, max_attempts, exc,
+            )
+
+        if attempt < max_attempts:
+            time.sleep(attempt)
+
+    if last_error:
+        log.warning("RETRY LATER %s: Drive download failed after retries: %s", name, last_error)
+    return None
 
 
 def extract_first_page_text(pdf_bytes: bytes) -> str:
@@ -267,15 +342,12 @@ def _document_from_match(match: re.Match, kind: str) -> Optional[DocumentNumber]
 def extract_document_number(text: str) -> Optional[DocumentNumber]:
     normalised = " ".join(text.upper().split())
 
-    # Credit note must win. Its page also contains the reversed INV/... reference.
     for pattern in (CREDIT_LABELLED_RE, CREDIT_EXPLICIT_RE):
         for match in pattern.finditer(normalised):
             document = _document_from_match(match, "credit_note")
             if document:
                 return document
 
-    # If the page clearly looks like a credit note but its RINV number is unreadable,
-    # fail safely instead of attaching it to the INV/... shown in "Reversal of".
     if CREDIT_CONTEXT_RE.search(normalised):
         return None
 
@@ -288,7 +360,6 @@ def extract_document_number(text: str) -> Optional[DocumentNumber]:
 
 
 def extract_invoice_number(text: str) -> Optional[str]:
-    """Backward-compatible helper used by existing tests."""
     document = extract_document_number(text)
     return document.filename_stem if document else None
 
@@ -304,7 +375,6 @@ def _crop(image: np.ndarray, y1: float, y2: float, x1: float, x2: float) -> np.n
 def extract_document_number_from_image(
     image: np.ndarray,
 ) -> Tuple[Optional[DocumentNumber], float, str]:
-    """Read the fixed Fresh Bake number row, with scan-friendly fallbacks."""
     number_row = _crop(image, 0.10, 0.18, 0.03, 0.53)
     header_block = _crop(image, 0.07, 0.22, 0.02, 0.60)
     upper_left_wide = _crop(image, 0.04, 0.27, 0.00, 0.72)
@@ -363,9 +433,9 @@ def process_file(d, file_object: dict, odoo_client=None) -> bool:
     parents = file_object.get("parents") or []
 
     try:
-        pdf_bytes = download_pdf_bytes(d, file_id)
+        pdf_bytes = download_pdf_bytes(d, file_object)
         if not pdf_bytes:
-            log.warning("RETRY LATER %s: no PDF bytes", name)
+            log.warning("RETRY LATER %s: no usable PDF bytes", name)
             return False
 
         document = extract_document_number(extract_first_page_text(pdf_bytes))
