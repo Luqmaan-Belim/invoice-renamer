@@ -2,6 +2,7 @@ import base64
 import os
 import re
 import xmlrpc.client
+from datetime import date, timedelta
 from typing import Any, Dict, List, Tuple
 
 
@@ -42,6 +43,32 @@ class OdooClient:
     def search_customer_invoice_by_number(self, odoo_number: str) -> List[int]:
         """Backward-compatible invoice-only helper."""
         return self.search_customer_document_by_number(odoo_number, "out_invoice")
+
+    def list_credit_note_claims(self, lookback_days: int = 120) -> List[Dict[str, Any]]:
+        """
+        Return customer credit notes that have claim_no populated.
+
+        No state filter is applied: draft and posted credit notes are both included.
+        The lookback keeps the every-minute lookup small while still covering the
+        normal scanned-claim backlog. Set lookback_days <= 0 to query all dates.
+        """
+        domain: List[Any] = [
+            ("move_type", "=", "out_refund"),
+            ("claim_no", "!=", False),
+        ]
+        if lookback_days > 0:
+            cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+            domain.append(("invoice_date", ">=", cutoff))
+
+        return self.models.execute_kw(
+            self.db, self.uid, self.api_key,
+            "account.move", "search_read", [domain],
+            {
+                "fields": ["id", "name", "claim_no", "partner_id", "invoice_date"],
+                "order": "invoice_date desc, id desc",
+                "limit": 50000,
+            },
+        )
 
     def ensure_pdf_attachment(
         self, move_id: int, filename: str, pdf_bytes: bytes
