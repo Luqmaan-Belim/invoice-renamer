@@ -1,5 +1,5 @@
 [Unit]
-Description=Fresh Bake invoice renamer sweep
+Description=Fresh Bake invoice and customer-claim renamer sweep
 Wants=network-online.target
 After=network-online.target
 
@@ -9,6 +9,6 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/invoice-renamer
 EnvironmentFile=/etc/invoice-renamer.env
-ExecStart=/opt/invoice-renamer/.venv/bin/python /opt/invoice-renamer/process_invoices.py
+ExecStart=/opt/invoice-renamer/.venv/bin/python /opt/invoice-renamer/runner.py
 Nice=5
 TimeoutStartSec=15min
