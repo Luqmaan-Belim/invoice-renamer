@@ -1,12 +1,15 @@
 name: invoice_renamer_fallback
 
 on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
   repository_dispatch:
     types: [drive_change]
-  workflow_dispatch: {}
 
-# Temporary fallback while the persistent OCI runner is being commissioned.
-# Only one sweep may run at a time.
+# Automatic GitHub fallback while the persistent OCI runner is being commissioned.
+# GitHub Actions scheduled workflows have a 5-minute minimum interval.
+# Only one sweep may run at a time so a slow backlog run cannot overlap the next one.
 concurrency:
   group: invoice-renamer-fallback
   cancel-in-progress: false
@@ -35,7 +38,7 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run bounded invoice and claim sweep
+      - name: Run bounded invoice, delivery note and claim sweep
         timeout-minutes: 15
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
@@ -49,5 +52,6 @@ jobs:
           MAX_FILES_PER_RUN: "40"
           CLAIM_LOOKBACK_DAYS: "365"
           REVIEW_RETRY_HOURS: "6"
+          MANUAL_REVIEW_AFTER: "2"
         run: |
           python runner.py
