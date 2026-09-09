@@ -1,24 +1,16 @@
-import os
 import base64
+import os
 import re
 import xmlrpc.client
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Tuple
 
 
 def to_odoo_invoice_name(scan_inv: str) -> str:
-    """
-    Convert '2026_000073' (or '2026_73') -> 'INV/2026/000073'
-    Keeps it strict and predictable.
-    """
-    m = re.fullmatch(r"(\d{4})_(\d{1,6})", scan_inv.strip())
-    if not m:
-        # If it doesn't match expected pattern, just return as-is
-        # (caller can decide whether to search differently)
+    """Backward-compatible conversion for legacy callers."""
+    match = re.fullmatch(r"(\d{4})_(\d{1,6})", scan_inv.strip())
+    if not match:
         return scan_inv.strip()
-
-    year = m.group(1)
-    seq = m.group(2).zfill(6)
-    return f"INV/{year}/{seq}"
+    return f"INV/{match.group(1)}/{match.group(2).zfill(6)}"
 
 
 class OdooClient:
@@ -32,24 +24,42 @@ class OdooClient:
         self.uid = common.authenticate(self.db, self.user, self.api_key, {})
         if not self.uid:
             raise RuntimeError("Odoo authentication failed (check ODOO_DB/USER/API_KEY).")
-
         self.models = xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/object")
 
-    def search_customer_invoice_by_number(self, odoo_number: str) -> List[int]:
-        """
-        Customer invoices are account.move with move_type = out_invoice.
-        Match by the posted invoice number in 'name' (e.g. 'INV/2026/000073').
-        """
+    def search_customer_document_by_number(
+        self, odoo_number: str, move_type: str
+    ) -> List[int]:
+        """Return every customer invoice/credit-note match, regardless of state."""
         domain = [
-            ("move_type", "=", "out_invoice"),
+            ("move_type", "=", move_type),
             ("name", "=", odoo_number),
         ]
         return self.models.execute_kw(
             self.db, self.uid, self.api_key,
-            "account.move", "search",
-            [domain],
-            {"limit": 5}
+            "account.move", "search", [domain]
         )
+
+    def search_customer_invoice_by_number(self, odoo_number: str) -> List[int]:
+        """Backward-compatible invoice-only helper."""
+        return self.search_customer_document_by_number(odoo_number, "out_invoice")
+
+    def ensure_pdf_attachment(
+        self, move_id: int, filename: str, pdf_bytes: bytes
+    ) -> Tuple[int, bool]:
+        """Return (attachment_id, created). Safe to call again after a retry."""
+        domain = [
+            ("res_model", "=", "account.move"),
+            ("res_id", "=", move_id),
+            ("name", "=", filename),
+            ("mimetype", "=", "application/pdf"),
+        ]
+        existing = self.models.execute_kw(
+            self.db, self.uid, self.api_key,
+            "ir.attachment", "search", [domain], {"limit": 1}
+        )
+        if existing:
+            return existing[0], False
+        return self.attach_pdf_to_move(move_id, filename, pdf_bytes), True
 
     def attach_pdf_to_move(self, move_id: int, filename: str, pdf_bytes: bytes) -> int:
         vals: Dict[str, Any] = {
@@ -62,6 +72,5 @@ class OdooClient:
         }
         return self.models.execute_kw(
             self.db, self.uid, self.api_key,
-            "ir.attachment", "create",
-            [vals]
+            "ir.attachment", "create", [vals]
         )
