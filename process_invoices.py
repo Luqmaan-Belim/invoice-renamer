@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-Invoice Renamer - changes-only Google Drive processor with optional Odoo attachment.
+Invoice Renamer - recurring Google Drive sweep with optional Odoo attachment.
 
-The first page is OCRed and renamed from an Odoo customer invoice number such as
-INV/2026/042130 to 2026_042130.pdf. The extractor prioritises the Fresh Bake
-invoice-number row and only accepts explicit invoice-number formats; company
-registration numbers and other slash-separated values are ignored.
+Every run recursively scans the configured Drive folder for outstanding IMG*.pdf
+files. The first page is OCRed and renamed from an Odoo customer invoice number
+such as INV/2026/042130 to 2026_042130.pdf. Files that cannot be processed remain
+with their IMG name so the next run automatically retries them.
 """
 
 import io
 import json
 import logging
 import os
-import pathlib
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import cv2
 import fitz  # PyMuPDF
@@ -22,7 +21,6 @@ import numpy as np
 import pytesseract
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
 
 logging.basicConfig(
@@ -37,19 +35,12 @@ SA_JSON = json.loads(os.environ["GDRIVE_SA_JSON"])
 DEBUG = os.environ.get("DEBUG_LIST", "0") == "1"
 ENABLE_ODOO = os.environ.get("ENABLE_ODOO", "0") == "1"
 
-TOKEN_PATH = pathlib.Path(".drive_change_token")
-TOKEN_APPDATA_NAME = "invoice-renamer-token"
-DISABLE_APPDATA_TOKEN = os.environ.get("DISABLE_APPDATA_TOKEN", "0") == "1"
-
 PDF_MT = "application/pdf"
 FOLDER_MT = "application/vnd.google-apps.folder"
 SHORTCUT_MT = "application/vnd.google-apps.shortcut"
 
 IMG_PDF_RE = re.compile(r"^IMG.*\.pdf$", re.I)
-RENAMED_RE = re.compile(r"^\d{4}(?:_\d{1,6})?(?:_\d+)?\.pdf$", re.I)
 
-# OCR commonly substitutes these letters for digits. Translation is applied only
-# inside a candidate invoice number, never to the rest of the page text.
 OCR_DIGIT_TRANSLATION = str.maketrans(
     {
         "O": "0",
@@ -68,17 +59,12 @@ OCR_YEAR = rf"(?P<year>(?:{OCR_DIGIT}\s*){{4}})"
 OCR_SERIAL = rf"(?P<serial>(?:{OCR_DIGIT}\s*){{1,6}})(?!{OCR_DIGIT})"
 OCR_SEPARATOR = r"\s*[/\\|_.-]\s*"
 
-# Important: the negative look-ahead after INV/NV prevents matching the 'nv' in
-# the word 'Invoice'. That old behaviour caused 'Tax Invoice Reg No: 2011/053816'
-# to be interpreted as invoice 2011_053816.
 EXPLICIT_INVOICE_RE = re.compile(
     rf"(?<![A-Z0-9])(?P<prefix>[I1L]\s*N\s*V|N\s*V)(?![A-Z0-9])"
     rf"[\s:#/\\|_.-]*{OCR_YEAR}{OCR_SEPARATOR}{OCR_SERIAL}",
     re.I,
 )
 
-# Safe fallback when OCR drops the INV token but still reads the specific field
-# label from the Fresh Bake template.
 LABELLED_INVOICE_RE = re.compile(
     rf"(?:TAX\s+)?INVOICE\s+"
     rf"(?:N[UO]M(?:BER|8ER)|NUMBER|NO\.?|NR\.?)"
@@ -114,128 +100,55 @@ def resolve_root(d, folder_id: str) -> Tuple[str, Optional[str]]:
     return meta["id"], meta.get("driveId")
 
 
-def get_start_token(d, drive_id: Optional[str]) -> str:
-    if drive_id:
-        response = d.changes().getStartPageToken(
-            driveId=drive_id,
-            supportsAllDrives=True,
-        ).execute()
-    else:
-        response = d.changes().getStartPageToken().execute()
-    return response["startPageToken"]
+def iter_outstanding_pdfs(d, root_id: str, drive_id: Optional[str]) -> Iterator[dict]:
+    """Recursively yield IMG*.pdf files below root_id."""
+    pending_folders = [root_id]
+    visited_folders = set()
 
+    while pending_folders:
+        folder_id = pending_folders.pop()
+        if folder_id in visited_folders:
+            continue
+        visited_folders.add(folder_id)
 
-def load_token(d) -> Optional[str]:
-    token: Optional[str] = None
+        page_token = None
+        while True:
+            kwargs = {
+                "q": f"'{folder_id}' in parents and trashed=false",
+                "fields": (
+                    "nextPageToken,files("
+                    "id,name,mimeType,parents,shortcutDetails(targetId,targetMimeType))"
+                ),
+                "pageSize": 1000,
+                "supportsAllDrives": True,
+                "includeItemsFromAllDrives": True,
+            }
+            if page_token:
+                kwargs["pageToken"] = page_token
+            if drive_id:
+                kwargs["corpora"] = "drive"
+                kwargs["driveId"] = drive_id
 
-    if not DISABLE_APPDATA_TOKEN:
-        try:
-            response = d.files().list(
-                spaces="appDataFolder",
-                q=f"name='{TOKEN_APPDATA_NAME}' and trashed=false",
-                fields="files(id)",
-                pageSize=1,
-            ).execute()
-            files = response.get("files") or []
-            if files:
-                data = d.files().get_media(fileId=files[0]["id"]).execute()
-                token = (
-                    data.decode("utf-8", errors="ignore").strip()
-                    if isinstance(data, bytes)
-                    else str(data).strip()
-                )
-        except Exception as exc:
-            log.warning("Unable to read Drive token from appData: %s", exc)
+            response = d.files().list(**kwargs).execute()
+            for item in response.get("files", []):
+                mime_type = item.get("mimeType")
+                name = item.get("name", "")
 
-    if token:
-        try:
-            TOKEN_PATH.write_text(token)
-        except Exception:
-            pass
-        return token
+                if mime_type == FOLDER_MT:
+                    pending_folders.append(item["id"])
+                    continue
 
-    try:
-        token = TOKEN_PATH.read_text().strip()
-        if not token:
-            return None
-        if not DISABLE_APPDATA_TOKEN:
-            log.info(
-                "Using local Drive change token fallback; set "
-                "DISABLE_APPDATA_TOKEN=1 to opt out of appData usage."
-            )
-        return token
-    except FileNotFoundError:
-        return None
+                if mime_type == SHORTCUT_MT:
+                    if DEBUG:
+                        log.info("SKIP shortcut %s", name)
+                    continue
 
+                if mime_type == PDF_MT and IMG_PDF_RE.match(name):
+                    yield item
 
-def save_token(d, token: str):
-    try:
-        TOKEN_PATH.write_text(token)
-    except Exception:
-        pass
-
-    if DISABLE_APPDATA_TOKEN:
-        return
-
-    media = MediaIoBaseUpload(io.BytesIO(token.encode("utf-8")), mimetype="text/plain")
-    try:
-        response = d.files().list(
-            spaces="appDataFolder",
-            q=f"name='{TOKEN_APPDATA_NAME}' and trashed=false",
-            fields="files(id)",
-            pageSize=1,
-        ).execute()
-        files = response.get("files") or []
-        if files:
-            d.files().update(fileId=files[0]["id"], media_body=media).execute()
-        else:
-            body = {"name": TOKEN_APPDATA_NAME, "parents": ["appDataFolder"]}
-            d.files().create(body=body, media_body=media, fields="id").execute()
-    except Exception as exc:
-        log.warning("Unable to save Drive token to appData: %s", exc)
-
-
-def file_meta(d, file_id: str, fields: str):
-    return d.files().get(
-        fileId=file_id,
-        fields=fields,
-        supportsAllDrives=True,
-    ).execute()
-
-
-def is_under_root(
-    d,
-    file_parents: List[str],
-    root_id: str,
-    parent_cache: Dict[str, Optional[List[str]]],
-) -> bool:
-    if not file_parents:
-        return False
-
-    stack = list(file_parents)
-    while stack:
-        parent_id = stack.pop()
-        if parent_id == root_id:
-            return True
-
-        if parent_id in parent_cache:
-            parents = parent_cache[parent_id]
-        else:
-            try:
-                metadata = d.files().get(
-                    fileId=parent_id,
-                    fields="id,parents",
-                    supportsAllDrives=True,
-                ).execute()
-                parents = metadata.get("parents") or []
-            except Exception:
-                parents = []
-            parent_cache[parent_id] = parents if parents else None
-
-        if parents:
-            stack.extend(parents)
-
-    return False
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
 
 
 def download_pdf_bytes(d, file_id: str) -> Optional[bytes]:
@@ -320,13 +233,6 @@ def _invoice_from_match(match: re.Match) -> Optional[str]:
 
 
 def extract_invoice_number(text: str) -> Optional[str]:
-    """
-    Extract an Odoo invoice number from OCR text.
-
-    Accepted examples include INV/2026/042130 and, as a guarded fallback,
-    'Tax Invoice Number 2026/042130'. A bare slash-separated number is never
-    accepted, so Fresh Bake's registration number cannot be selected.
-    """
     normalised_text = " ".join(text.upper().split())
 
     for pattern in (EXPLICIT_INVOICE_RE, LABELLED_INVOICE_RE):
@@ -404,20 +310,95 @@ def rename_in_drive(d, file_id: str, new_name: str):
     ).execute()
 
 
+def process_file(d, file_object: dict, odoo_client=None, to_odoo_invoice_name=None) -> bool:
+    """Process one outstanding IMG PDF. Return True only when it was renamed."""
+    file_id = file_object["id"]
+    name = file_object.get("name", "")
+    parents = file_object.get("parents") or []
+
+    try:
+        pdf_bytes = download_pdf_bytes(d, file_id)
+        if not pdf_bytes:
+            log.warning("RETRY LATER %s: no PDF bytes", name)
+            return False
+
+        image = rasterize_first_page(pdf_bytes)
+        if image is None:
+            log.warning("RETRY LATER %s: could not rasterize first page", name)
+            return False
+
+        invoice, confidence, source = extract_invoice_number_from_image(image)
+        if not invoice:
+            log.warning(
+                "RETRY LATER %s: invoice number not confidently found "
+                "(best OCR confidence=%.1f)",
+                name,
+                confidence,
+            )
+            return False
+
+        parent_id = parents[0] if parents else FOLDER_ID
+        new_name = unique_name_in_folder(d, parent_id, f"{invoice}.pdf")
+        rename_in_drive(d, file_id, new_name)
+        log.info(
+            "RENAMED %s -> %s (source=%s confidence=%.1f)",
+            name,
+            new_name,
+            source,
+            confidence,
+        )
+
+        if ENABLE_ODOO and odoo_client and to_odoo_invoice_name:
+            try:
+                odoo_number = to_odoo_invoice_name(invoice)
+                matches = odoo_client.search_customer_invoice_by_number(odoo_number)
+
+                if len(matches) == 1:
+                    move_id = matches[0]
+                    attachment_id = odoo_client.attach_pdf_to_move(
+                        move_id,
+                        new_name,
+                        pdf_bytes,
+                    )
+                    log.info(
+                        "ODOO ATTACHED %s to invoice=%s move_id=%s attachment_id=%s",
+                        new_name,
+                        odoo_number,
+                        move_id,
+                        attachment_id,
+                    )
+                elif not matches:
+                    log.warning(
+                        "ODOO NO MATCH for invoice=%s (scan=%s) file=%s",
+                        odoo_number,
+                        invoice,
+                        new_name,
+                    )
+                else:
+                    log.warning(
+                        "ODOO MULTIPLE MATCHES for invoice=%s -> %s (file=%s)",
+                        odoo_number,
+                        matches,
+                        new_name,
+                    )
+            except Exception as exc:
+                log.warning(
+                    "ODOO ATTACH FAILED for %s (invoice=%s): %s",
+                    new_name,
+                    invoice,
+                    exc,
+                )
+
+        return True
+
+    except Exception as exc:
+        log.exception("RETRY LATER %s: processing failed: %s", name, exc)
+        return False
+
+
 def main():
     d = drive()
     root_id, drive_id = resolve_root(d, FOLDER_ID)
-
-    token = load_token(d)
-    if not token:
-        token = get_start_token(d, drive_id)
-        save_token(d, token)
-        log.info("Initialized change token; next run will process deltas.")
-        return
-
-    parent_cache: Dict[str, Optional[List[str]]] = {}
-    processed = 0
-    next_token = None
 
     odoo_client = None
     to_odoo_invoice_name = None
@@ -432,142 +413,23 @@ def main():
         except Exception as exc:
             log.warning("Odoo integration requested but failed to init: %s", exc)
 
-    while True:
-        kwargs = {
-            "pageToken": token,
-            "fields": "nextPageToken,newStartPageToken,changes(fileId,removed,file)",
-            "includeItemsFromAllDrives": True,
-            "supportsAllDrives": True,
-        }
-        if drive_id:
-            kwargs["driveId"] = drive_id
+    discovered = 0
+    renamed = 0
+    failed = 0
 
-        response = d.changes().list(**kwargs).execute()
+    for file_object in iter_outstanding_pdfs(d, root_id, drive_id):
+        discovered += 1
+        if process_file(d, file_object, odoo_client, to_odoo_invoice_name):
+            renamed += 1
+        else:
+            failed += 1
 
-        for change in response.get("changes", []):
-            file_id = change.get("fileId")
-            removed = change.get("removed", False)
-            file_object = change.get("file") or {}
-
-            if removed or not file_object or file_object.get("trashed"):
-                continue
-            if file_object.get("mimeType") != PDF_MT:
-                continue
-
-            name = file_object.get("name", "")
-            parents = file_object.get("parents") or []
-
-            if RENAMED_RE.match(name or ""):
-                if DEBUG:
-                    log.info("SKIP %s already looks renamed", name)
-                continue
-            if not IMG_PDF_RE.match(name or ""):
-                if DEBUG:
-                    log.info("SKIP %s not IMG*.pdf", name)
-                continue
-
-            if not parents:
-                metadata = file_meta(d, file_id, "id,name,parents,trashed")
-                if metadata.get("trashed"):
-                    continue
-                name = metadata.get("name", name)
-                parents = metadata.get("parents") or []
-
-            if not is_under_root(d, parents, root_id, parent_cache):
-                if DEBUG:
-                    log.info("SKIP %s outside target tree", name)
-                continue
-
-            pdf_bytes = download_pdf_bytes(d, file_id)
-            if not pdf_bytes:
-                log.warning("SKIP %s no PDF bytes", name)
-                continue
-
-            image = rasterize_first_page(pdf_bytes)
-            if image is None:
-                log.warning("SKIP %s could not rasterize first page", name)
-                continue
-
-            invoice, confidence, source = extract_invoice_number_from_image(image)
-            if not invoice:
-                # Do not turn an unreadable scan into UNKNOWN.pdf. Keeping the IMG
-                # name makes the exception visible and prevents a false attachment.
-                log.warning(
-                    "SKIP %s invoice number not confidently found "
-                    "(best OCR confidence=%.1f)",
-                    name,
-                    confidence,
-                )
-                continue
-
-            parent_id = parents[0] if parents else root_id
-            new_name = unique_name_in_folder(d, parent_id, f"{invoice}.pdf")
-
-            if new_name == name:
-                if DEBUG:
-                    log.info("SKIP %s name unchanged", name)
-                continue
-
-            rename_in_drive(d, file_id, new_name)
-            log.info(
-                "RENAMED %s -> %s (source=%s confidence=%.1f)",
-                name,
-                new_name,
-                source,
-                confidence,
-            )
-            processed += 1
-
-            if ENABLE_ODOO and odoo_client and to_odoo_invoice_name:
-                try:
-                    odoo_number = to_odoo_invoice_name(invoice)
-                    matches = odoo_client.search_customer_invoice_by_number(odoo_number)
-
-                    if len(matches) == 1:
-                        move_id = matches[0]
-                        attachment_id = odoo_client.attach_pdf_to_move(
-                            move_id,
-                            new_name,
-                            pdf_bytes,
-                        )
-                        log.info(
-                            "ODOO ATTACHED %s to invoice=%s move_id=%s attachment_id=%s",
-                            new_name,
-                            odoo_number,
-                            move_id,
-                            attachment_id,
-                        )
-                    elif not matches:
-                        log.warning(
-                            "ODOO NO MATCH for invoice=%s (scan=%s) file=%s",
-                            odoo_number,
-                            invoice,
-                            new_name,
-                        )
-                    else:
-                        log.warning(
-                            "ODOO MULTIPLE MATCHES for invoice=%s -> %s (file=%s)",
-                            odoo_number,
-                            matches,
-                            new_name,
-                        )
-                except Exception as exc:
-                    log.warning(
-                        "ODOO ATTACH FAILED for %s (invoice=%s): %s",
-                        new_name,
-                        invoice,
-                        exc,
-                    )
-
-        token = response.get("nextPageToken")
-        if not token:
-            next_token = response.get("newStartPageToken")
-            break
-
-    if next_token:
-        save_token(d, next_token)
-
-    log.info("Processed %d file(s) this run.", processed)
+    log.info(
+        "Sweep complete: outstanding=%d renamed=%d retry_later=%d",
+        discovered,
+        renamed,
+        failed,
+    )
 
 
 if __name__ == "__main__":
