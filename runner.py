@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Bounded Fresh Bake invoice/claim renamer sweep.
+"""Bounded Fresh Bake invoice, claim and signed-delivery-note renamer sweep.
 
-This runner keeps the recurring job fast:
+The recurring runner is intentionally idempotent and backlog-safe:
 - newest outstanding IMG PDFs are handled first;
 - genuine zero-byte files are marked and skipped cheaply;
-- unresolved files are parked for a configurable retry window instead of being
-  OCRed every minute forever;
 - Fresh Bake invoices/credit notes are matched by INV/RINV number;
-- customer claim/debit-note documents are matched against account.move.claim_no
-  values already present in Odoo, independent of customer document layout.
+- signed Fresh Bake Delivery Notes are matched through their S... sale-order number
+  and attached to the related customer invoice(s);
+- customer claim/debit-note documents are matched against account.move.claim_no;
+- unresolved/unsupported scans are bounded instead of being OCRed forever;
+- PARSER_VERSION makes previously parked files retry immediately when recognition
+  logic improves.
 """
 
 import logging
@@ -28,11 +30,25 @@ log = logging.getLogger("invoice_renamer")
 MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "40"))
 CLAIM_LOOKBACK_DAYS = int(os.environ.get("CLAIM_LOOKBACK_DAYS", "365"))
 REVIEW_RETRY_HOURS = int(os.environ.get("REVIEW_RETRY_HOURS", "6"))
+MAX_REVIEW_ATTEMPTS = int(os.environ.get("MAX_REVIEW_ATTEMPTS", "2"))
+PARSER_VERSION = "3"
 
 STATUS_KEY = "invoice_renamer_status"
 ATTEMPTS_KEY = "invoice_renamer_attempts"
 RETRY_AFTER_KEY = "invoice_renamer_retry_after"
 MD5_KEY = "invoice_renamer_md5"
+VERSION_KEY = "invoice_renamer_parser_version"
+REASON_KEY = "invoice_renamer_reason"
+
+ORDER_TRANSLATION = str.maketrans({
+    "O": "0", "Q": "0", "D": "0", "I": "1", "L": "1",
+    "Z": "2", "S": "5", "G": "6", "B": "8",
+})
+ORDER_TOKEN_RE = re.compile(
+    r"(?<![A-Z0-9])([S$53][\s._'’:/\\-]*(?:[0-9OQDISBGLZI1][\s._'’:/\\-]*){5,8})(?![A-Z0-9])",
+    re.I,
+)
+DELIVERY_CONTEXT_RE = re.compile(r"(?:D|B|O)?ELIVERY\s+[FN]?OTE|DELIVERY\s+NOTE", re.I)
 
 
 def _int(value, default=0):
@@ -73,13 +89,20 @@ def _eligible(item: dict) -> Tuple[bool, str]:
     props = item.get("appProperties") or {}
     size = _int(item.get("size"), -1)
     status = props.get(STATUS_KEY, "")
+    parser_version = props.get(VERSION_KEY, "")
 
     if size == 0:
         return False, "zero-byte"
 
-    # If a formerly zero-byte file later receives content, process it normally.
     if status == "zero_byte" and size > 0:
         return True, "zero-byte-recovered"
+
+    # Recognition logic changed: immediately retry files parked by an older parser.
+    if status in {"review", "manual_review"} and parser_version != PARSER_VERSION:
+        return True, "parser-upgraded"
+
+    if status == "manual_review":
+        return False, "manual-review"
 
     if status == "review":
         current_md5 = item.get("md5Checksum") or ""
@@ -149,7 +172,10 @@ def _load_claim_index(odoo_client) -> Dict[str, List[dict]]:
         enriched["partner_name"] = partner_name
         index[norm].append(enriched)
 
-    log.info("Loaded %d distinct Odoo claim numbers (%d credit notes)", len(index), sum(map(len, index.values())))
+    log.info(
+        "Loaded %d distinct Odoo claim numbers (%d credit notes)",
+        len(index), sum(map(len, index.values())),
+    )
     return index
 
 
@@ -167,7 +193,10 @@ def _ocr_full_page_rotations(image: np.ndarray) -> Tuple[List[str], float]:
             if text:
                 texts.append(text)
                 if core.DEBUG:
-                    log.info("CLAIM OCR angle=%s mode=%s confidence=%.1f text=%r", angle, label, confidence, text)
+                    log.info(
+                        "CLAIM OCR angle=%s mode=%s confidence=%.1f text=%r",
+                        angle, label, confidence, text,
+                    )
     return texts, best_conf
 
 
@@ -178,7 +207,6 @@ def _match_claim(texts: List[str], claim_index: Dict[str, List[dict]]) -> Tuple[
     normalised_texts = [(_normalise(text), text.upper()) for text in texts]
     matched: Dict[str, List[dict]] = {}
 
-    # Prefer longer claim numbers: they are materially less likely to occur by chance.
     for claim_norm in sorted(claim_index, key=len, reverse=True):
         rows = claim_index[claim_norm]
         for compact, raw_upper in normalised_texts:
@@ -186,8 +214,6 @@ def _match_claim(texts: List[str], claim_index: Dict[str, List[dict]]) -> Tuple[
                 continue
 
             if len(claim_norm) <= 4:
-                # Short references such as 126 are unsafe by themselves. Require a
-                # meaningful customer-name token from Odoo to be visible as well.
                 partner_ok = False
                 for row in rows:
                     tokens = _partner_tokens(row.get("partner_name", ""))
@@ -235,9 +261,100 @@ def _attach_to_rows(odoo_client, rows: List[dict], filename: str, pdf_bytes: byt
         )
 
 
+def _normalise_order_token(raw: str) -> Optional[str]:
+    value = re.sub(r"[\s._'’:/\\-]+", "", (raw or "").upper())
+    if not value:
+        return None
+    if value[0] in "53$":
+        value = "S" + value[1:]
+    if not value.startswith("S"):
+        return None
+    digits = re.sub(r"[^A-Z0-9]", "", value[1:]).translate(ORDER_TRANSLATION)
+    digits = re.sub(r"\D", "", digits)
+    if not 5 <= len(digits) <= 8:
+        return None
+    return "S" + digits
+
+
+def _delivery_order_candidates(text: str) -> List[str]:
+    """Extract S... candidates only from delivery/order/reference lines."""
+    candidates: List[str] = []
+    for line in (text or "").splitlines():
+        upper = line.upper()
+        if not (
+            "DELIVERY" in upper or "ELIVERY" in upper or
+            "ORDER" in upper or "RDER" in upper or
+            "REFERENCE" in upper or "EFERENCE" in upper
+        ):
+            continue
+        for match in ORDER_TOKEN_RE.finditer(upper):
+            candidate = _normalise_order_token(match.group(1))
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def _delivery_header_ocr(image: np.ndarray) -> Tuple[str, float]:
+    """OCR just the top quarter where Fresh Bake prints Delivery Note Number."""
+    height, width = image.shape[:2]
+    crop = image[
+        int(height * 0.035):int(height * 0.27),
+        int(width * 0.01):int(width * 0.92),
+    ]
+    best_text = ""
+    best_conf = 0.0
+    for prepared, psm in (
+        (crop, 6),
+        (core.preprocess_image(crop), 6),
+        (core.adaptive_preprocess(crop), 6),
+    ):
+        text, confidence = core.ocr_with_confidence(prepared, psm=psm)
+        if confidence > best_conf:
+            best_conf = confidence
+            best_text = text
+        # Header OCR is cheap, and a valid candidate lets us stop immediately.
+        if _delivery_order_candidates(text):
+            return text, confidence
+    return best_text, best_conf
+
+
+def _looks_like_delivery_note(text: str) -> bool:
+    upper = (text or "").upper()
+    return bool(DELIVERY_CONTEXT_RE.search(upper)) or (
+        "FRESH BAKE" in upper and ("DELIVERY" in upper or "ELIVERY" in upper)
+    )
+
+
+def _delivery_filename(order_name: str, moves: List[dict]) -> str:
+    invoice_names = sorted({str(move.get("name") or "").strip() for move in moves if move.get("name")})
+    if len(invoice_names) == 1:
+        return f"DN_{order_name}_{_safe_rinv_filename(invoice_names[0])}.pdf"
+    return f"DN_{order_name}.pdf"
+
+
 def _park_for_review(d, item: dict, reason: str):
     props = item.get("appProperties") or {}
     attempts = _int(props.get(ATTEMPTS_KEY), 0) + 1
+
+    if attempts >= MAX_REVIEW_ATTEMPTS:
+        _set_properties(
+            d,
+            item,
+            **{
+                STATUS_KEY: "manual_review",
+                ATTEMPTS_KEY: attempts,
+                RETRY_AFTER_KEY: None,
+                MD5_KEY: item.get("md5Checksum") or "",
+                VERSION_KEY: PARSER_VERSION,
+                REASON_KEY: reason[:100],
+            },
+        )
+        log.warning(
+            "MANUAL REVIEW %s: stopped automatic retries after %d attempts (reason=%s)",
+            item.get("name"), attempts, reason,
+        )
+        return
+
     retry_after = int(time.time() + REVIEW_RETRY_HOURS * 3600)
     _set_properties(
         d,
@@ -247,13 +364,31 @@ def _park_for_review(d, item: dict, reason: str):
             ATTEMPTS_KEY: attempts,
             RETRY_AFTER_KEY: retry_after,
             MD5_KEY: item.get("md5Checksum") or "",
-            "invoice_renamer_reason": reason[:100],
+            VERSION_KEY: PARSER_VERSION,
+            REASON_KEY: reason[:100],
         },
     )
     log.warning(
-        "PARKED %s for review/retry in %dh (attempt=%d reason=%s)",
-        item.get("name"), REVIEW_RETRY_HOURS, attempts, reason,
+        "PARKED %s for retry in %dh (attempt=%d/%d reason=%s)",
+        item.get("name"), REVIEW_RETRY_HOURS, attempts, MAX_REVIEW_ATTEMPTS, reason,
     )
+
+
+def _clear_failure_state(d, item: dict):
+    props = item.get("appProperties") or {}
+    if any(key in props for key in (STATUS_KEY, ATTEMPTS_KEY, RETRY_AFTER_KEY, MD5_KEY, REASON_KEY, VERSION_KEY)):
+        _set_properties(
+            d,
+            item,
+            **{
+                STATUS_KEY: None,
+                ATTEMPTS_KEY: None,
+                RETRY_AFTER_KEY: None,
+                MD5_KEY: None,
+                REASON_KEY: None,
+                VERSION_KEY: None,
+            },
+        )
 
 
 def process_one(d, item: dict, odoo_client, claim_index: Dict[str, List[dict]]) -> bool:
@@ -267,7 +402,8 @@ def process_one(d, item: dict, odoo_client, claim_index: Dict[str, List[dict]]) 
                 d, item,
                 **{
                     STATUS_KEY: "zero_byte",
-                    "invoice_renamer_reason": "Drive file size is 0 bytes",
+                    VERSION_KEY: PARSER_VERSION,
+                    REASON_KEY: "Drive file size is 0 bytes",
                 },
             )
             log.warning("ZERO BYTE %s: marked once and excluded from OCR", name)
@@ -278,13 +414,14 @@ def process_one(d, item: dict, odoo_client, claim_index: Dict[str, List[dict]]) 
         _park_for_review(d, item, "download failed or incomplete")
         return False
 
-    # 1) Native/embedded PDF text first: practically free for digitally generated PDFs.
-    document = core.extract_document_number(core.extract_first_page_text(pdf_bytes))
+    pdf_text = core.extract_first_page_text(pdf_bytes)
+
+    # 1) Fresh Bake invoice / Fresh Bake credit note.
+    document = core.extract_document_number(pdf_text)
     image = None
     confidence = 100.0 if document else 0.0
     source = "pdf-text" if document else ""
 
-    # 2) Fresh Bake layout OCR.
     if not document:
         image = core.rasterize_first_page(pdf_bytes)
         if image is None:
@@ -305,6 +442,7 @@ def process_one(d, item: dict, odoo_client, claim_index: Dict[str, List[dict]]) 
         filename = core.unique_name_in_folder(d, parent_id, f"{document.filename_stem}.pdf")
         for move_id in matches:
             odoo_client.ensure_pdf_attachment(move_id, filename, pdf_bytes)
+        _clear_failure_state(d, item)
         core.rename_in_drive(d, item["id"], filename)
         log.info(
             "RENAMED %s -> %s (document=%s source=%s confidence=%.1f matches=%d)",
@@ -312,9 +450,78 @@ def process_one(d, item: dict, odoo_client, claim_index: Dict[str, List[dict]]) 
         )
         return True
 
-    # 3) Unknown customer format: match the whole page against Odoo claim_no values.
+    # 2) Signed Fresh Bake Delivery Note -> sale.order -> related customer invoice(s).
+    delivery_candidates = _delivery_order_candidates(pdf_text)
+    looks_delivery = _looks_like_delivery_note(pdf_text)
+
     if image is None:
         image = core.rasterize_first_page(pdf_bytes)
+
+    if image is not None and (looks_delivery or not delivery_candidates):
+        header_text, header_confidence = _delivery_header_ocr(image)
+        header_candidates = _delivery_order_candidates(header_text)
+        for candidate in header_candidates:
+            if candidate not in delivery_candidates:
+                delivery_candidates.append(candidate)
+        looks_delivery = looks_delivery or _looks_like_delivery_note(header_text)
+        if core.DEBUG and header_text:
+            log.info(
+                "DELIVERY HEADER OCR %s candidates=%s confidence=%.1f text=%r",
+                name, delivery_candidates, header_confidence, header_text,
+            )
+
+    if looks_delivery and delivery_candidates:
+        if not odoo_client:
+            _park_for_review(d, item, "Odoo unavailable for delivery note")
+            return False
+
+        resolved = odoo_client.find_sale_orders_with_customer_invoices(delivery_candidates)
+        viable = [row for row in resolved if row.get("invoice_moves")]
+
+        # Odoo is the disambiguator: OCR may produce several S... strings, but only
+        # the actual sale.order with a related customer invoice is acceptable.
+        if len(viable) == 1:
+            order = viable[0]
+            moves = order["invoice_moves"]
+            parent_id = (item.get("parents") or [core.FOLDER_ID])[0]
+            filename = core.unique_name_in_folder(
+                d, parent_id, _delivery_filename(order["name"], moves)
+            )
+            for move in moves:
+                attachment_id, created = odoo_client.ensure_pdf_attachment(
+                    move["id"], filename, pdf_bytes
+                )
+                log.info(
+                    "%s %s order=%s invoice=%s move_id=%s attachment_id=%s",
+                    "ODOO ATTACHED DELIVERY NOTE" if created else "DELIVERY ATTACHMENT ALREADY EXISTS",
+                    filename, order["name"], move.get("name"), move["id"], attachment_id,
+                )
+            _clear_failure_state(d, item)
+            core.rename_in_drive(d, item["id"], filename)
+            log.info(
+                "DELIVERY MATCH %s -> %s order=%s invoices=%s",
+                name, filename, order["name"], [move.get("name") for move in moves],
+            )
+            return True
+
+        if len(viable) > 1:
+            _park_for_review(
+                d, item,
+                f"delivery note ambiguous; candidates {[row['name'] for row in viable]}",
+            )
+            return False
+
+        _park_for_review(
+            d, item,
+            f"delivery note order candidates {delivery_candidates} have no related customer invoice",
+        )
+        return False
+
+    if looks_delivery and not delivery_candidates:
+        _park_for_review(d, item, "Fresh Bake delivery note number could not be read")
+        return False
+
+    # 3) Unknown customer credit/debit-note format -> match Odoo claim_no.
     if image is None:
         _park_for_review(d, item, "could not rasterize customer claim")
         return False
@@ -322,12 +529,16 @@ def process_one(d, item: dict, odoo_client, claim_index: Dict[str, List[dict]]) 
     texts, claim_confidence = _ocr_full_page_rotations(image)
     claim_norm, rows = _match_claim(texts, claim_index)
     if not claim_norm or not rows:
-        _park_for_review(d, item, f"no unique Odoo claim_no found; OCR confidence {claim_confidence:.1f}")
+        _park_for_review(
+            d, item,
+            f"unsupported/unmatched document; no unique Odoo claim_no; OCR confidence {claim_confidence:.1f}",
+        )
         return False
 
     parent_id = (item.get("parents") or [core.FOLDER_ID])[0]
     filename = core.unique_name_in_folder(d, parent_id, _claim_filename(claim_norm, rows))
     _attach_to_rows(odoo_client, rows, filename, pdf_bytes)
+    _clear_failure_state(d, item)
     core.rename_in_drive(d, item["id"], filename)
     log.info(
         "CLAIM MATCH %s -> %s claim=%s attached_to=%s confidence=%.1f",
@@ -353,7 +564,7 @@ def main():
     all_items = list(iter_outstanding_pdfs(d, root_id, drive_id))
     all_items.sort(key=lambda item: item.get("modifiedTime") or "", reverse=True)
 
-    zero_marked = parked_skipped = eligible_count = processed = renamed = failed = 0
+    zero_marked = parked_skipped = manual_skipped = eligible_count = processed = renamed = failed = 0
     queue: List[dict] = []
 
     for item in all_items:
@@ -363,12 +574,19 @@ def main():
             if props.get(STATUS_KEY) != "zero_byte":
                 _set_properties(
                     d, item,
-                    **{STATUS_KEY: "zero_byte", "invoice_renamer_reason": "Drive file size is 0 bytes"},
+                    **{
+                        STATUS_KEY: "zero_byte",
+                        VERSION_KEY: PARSER_VERSION,
+                        REASON_KEY: "Drive file size is 0 bytes",
+                    },
                 )
                 zero_marked += 1
             continue
         if not eligible:
-            parked_skipped += 1
+            if reason == "manual-review":
+                manual_skipped += 1
+            else:
+                parked_skipped += 1
             continue
         queue.append(item)
 
@@ -392,9 +610,9 @@ def main():
 
     log.info(
         "Sweep complete: outstanding=%d eligible=%d processed=%d renamed=%d failed=%d "
-        "parked_skipped=%d zero_marked=%d cap=%d",
+        "parked_skipped=%d manual_skipped=%d zero_marked=%d cap=%d parser=%s",
         len(all_items), eligible_count, processed, renamed, failed,
-        parked_skipped, zero_marked, MAX_FILES_PER_RUN,
+        parked_skipped, manual_skipped, zero_marked, MAX_FILES_PER_RUN, PARSER_VERSION,
     )
 
 
