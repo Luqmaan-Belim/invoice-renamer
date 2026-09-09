@@ -4,7 +4,7 @@ import unittest
 os.environ.setdefault("GDRIVE_FOLDER_ID", "test-folder")
 os.environ.setdefault("GDRIVE_SA_JSON", "{}")
 
-from process_invoices import extract_invoice_number
+from process_invoices import extract_document_number, extract_invoice_number
 
 
 class InvoiceNumberExtractionTests(unittest.TestCase):
@@ -42,6 +42,30 @@ class InvoiceNumberExtractionTests(unittest.TestCase):
             extract_invoice_number("Tax Invoice Number I N V / 2O26 / O4213O"),
             "2026_042130",
         )
+
+    def test_credit_note_number_is_recognised(self):
+        doc = extract_document_number("Credit Note Number RINV/2026/08281")
+        self.assertIsNotNone(doc)
+        self.assertEqual(doc.kind, "credit_note")
+        self.assertEqual(doc.odoo_number, "RINV/2026/08281")
+        self.assertEqual(doc.filename_stem, "RINV_2026_08281")
+        self.assertEqual(doc.move_type, "out_refund")
+
+    def test_credit_note_never_uses_reversal_invoice_reference(self):
+        text = (
+            "Credit Note Number RINV/2026/08281 Credit Note Date 09/09/2026 "
+            "Reference Reversal of: INV/2026/052913"
+        )
+        doc = extract_document_number(text)
+        self.assertEqual(doc.odoo_number, "RINV/2026/08281")
+
+    def test_unreadable_credit_note_does_not_use_reversal_invoice(self):
+        text = "Credit Note Number unreadable Reference Reversal of: INV/2026/052913"
+        self.assertIsNone(extract_document_number(text))
+
+    def test_credit_note_label_fallback_without_prefix(self):
+        doc = extract_document_number("Credit Note Number 2026/8281")
+        self.assertEqual(doc.odoo_number, "RINV/2026/08281")
 
 
 if __name__ == "__main__":
