@@ -70,6 +70,72 @@ class OdooClient:
             },
         )
 
+    def find_sale_orders_with_customer_invoices(
+        self, order_names: List[str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Resolve scanned Fresh Bake Delivery Note / Sale Order numbers to invoices.
+
+        The Delivery Note Number printed by Fresh Bake is the sale.order name
+        (for example S113982). We deliberately do not filter invoice state: draft
+        and posted customer invoices are both valid attachment targets.
+        """
+        names = sorted({name.strip() for name in order_names if name and name.strip()})
+        if not names:
+            return []
+
+        orders = self.models.execute_kw(
+            self.db, self.uid, self.api_key,
+            "sale.order", "search_read", [[("name", "in", names)]],
+            {"fields": ["id", "name", "invoice_ids"], "limit": 100},
+        )
+        if not orders:
+            return []
+
+        invoice_ids = sorted({
+            move_id
+            for order in orders
+            for move_id in (order.get("invoice_ids") or [])
+        })
+
+        moves_by_id: Dict[int, Dict[str, Any]] = {}
+        if invoice_ids:
+            moves = self.models.execute_kw(
+                self.db, self.uid, self.api_key,
+                "account.move", "search_read",
+                [[("id", "in", invoice_ids), ("move_type", "=", "out_invoice")]],
+                {"fields": ["id", "name", "state", "invoice_origin"], "limit": 1000},
+            )
+            moves_by_id = {move["id"]: move for move in moves}
+
+        results: List[Dict[str, Any]] = []
+        for order in orders:
+            move_rows = [
+                moves_by_id[move_id]
+                for move_id in (order.get("invoice_ids") or [])
+                if move_id in moves_by_id
+            ]
+
+            # Fallback for custom invoice creation paths where invoice_ids has not
+            # been populated but invoice_origin still carries the SO number.
+            if not move_rows:
+                fallback = self.models.execute_kw(
+                    self.db, self.uid, self.api_key,
+                    "account.move", "search_read",
+                    [[
+                        ("move_type", "=", "out_invoice"),
+                        ("invoice_origin", "ilike", order["name"]),
+                    ]],
+                    {"fields": ["id", "name", "state", "invoice_origin"], "limit": 100},
+                )
+                move_rows = fallback
+
+            enriched = dict(order)
+            enriched["invoice_moves"] = move_rows
+            results.append(enriched)
+
+        return results
+
     def ensure_pdf_attachment(
         self, move_id: int, filename: str, pdf_bytes: bytes
     ) -> Tuple[int, bool]:
