@@ -1,17 +1,30 @@
-name: invoice_renamer_fallback
+name: invoice_renamer
 
 on:
+  # Heartbeat only. GitHub scheduled events can be delayed/dropped, so the
+  # workflow also queues its own next run after each completed sweep.
   schedule:
-    - cron: "2-57/5 * * * *"
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch: {}
   repository_dispatch:
     types: [drive_change]
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/invoice-renamer.yml"
+      - "runner.py"
+      - "process_invoices.py"
+      - "odoo_attach.py"
+      - "requirements.txt"
 
-# Automatic GitHub fallback while the persistent OCI runner is being commissioned.
-# Offset away from minute 0 to reduce the chance of GitHub schedule delays/drops.
-# Only one sweep may run at a time so a slow backlog run cannot overlap the next one.
+permissions:
+  contents: read
+  actions: write
+
+# Never OCR the same Drive backlog in parallel. GitHub keeps at most one running
+# and one pending run in this concurrency group.
 concurrency:
-  group: invoice-renamer-fallback
+  group: invoice-renamer-production
   cancel-in-progress: false
 
 jobs:
@@ -32,13 +45,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install Python requirements
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run bounded invoice, delivery note and claim sweep
+      - name: Run invoice, delivery note and claim sweep
         timeout-minutes: 15
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
@@ -55,3 +69,20 @@ jobs:
           MANUAL_REVIEW_AFTER: "2"
         run: |
           python runner.py
+
+      # Primary scheduler: after this sweep finishes, keep this job alive for one
+      # minute and queue the next workflow_dispatch run. workflow_dispatch events
+      # created with GITHUB_TOKEN are explicitly allowed to start another workflow.
+      - name: Queue next run in 60 seconds
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep 60
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/invoice-renamer.yml/dispatches" \
+            --data '{"ref":"main"}'
