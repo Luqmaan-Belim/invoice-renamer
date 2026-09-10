@@ -2,13 +2,13 @@ name: invoice_renamer_fallback
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "2-57/5 * * * *"
   workflow_dispatch: {}
   repository_dispatch:
     types: [drive_change]
 
 # Automatic GitHub fallback while the persistent OCI runner is being commissioned.
-# GitHub Actions scheduled workflows have a 5-minute minimum interval.
+# Offset away from minute 0 to reduce the chance of GitHub schedule delays/drops.
 # Only one sweep may run at a time so a slow backlog run cannot overlap the next one.
 concurrency:
   group: invoice-renamer-fallback
