@@ -14,7 +14,7 @@ import logging
 import os
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -94,6 +94,20 @@ def _clear_state(d, item: dict):
     )
     if any(key in _props(item) for key in keys):
         _set_properties(d, item, **{key: None for key in keys})
+
+
+def _review_reason_category(reason: str) -> str:
+    """Aggregate stored review reasons without exposing document identifiers."""
+    reason = (reason or "").lower()
+    if "unsupported/unmatched" in reason or "no unique odoo claim" in reason:
+        return "unsupported_or_unmatched_document"
+    if "ambiguous" in reason:
+        return "ambiguous_delivery_note"
+    if "delivery note number could not be read" in reason:
+        return "unreadable_delivery_note"
+    if "could not rasterize" in reason:
+        return "unreadable_pdf"
+    return "other_or_missing_reason"
 
 
 def _mark_manual_review(d, item: dict, reason: str):
@@ -582,6 +596,7 @@ def main():
     all_items = list(iter_outstanding_pdfs(d, root_id, drive_id))
 
     deleted_zero = delete_failed = manual_skipped = waiting_skipped = 0
+    manual_review_reasons = Counter()
     new_items: List[dict] = []
     retry_items: List[dict] = []
 
@@ -597,6 +612,7 @@ def main():
         if not eligible:
             if reason == "manual-review":
                 manual_skipped += 1
+                manual_review_reasons[_review_reason_category(_props(item).get(REASON_KEY, ""))] += 1
             else:
                 waiting_skipped += 1
             continue
@@ -606,6 +622,7 @@ def main():
         else:
             retry_items.append(item)
 
+    log.info("Manual review backlog: %d; reasons=%s", manual_skipped, dict(sorted(manual_review_reasons.items())))
     newest_first = lambda item: item.get("modifiedTime") or ""
     new_items.sort(key=newest_first, reverse=True)
     retry_items.sort(key=newest_first, reverse=True)
